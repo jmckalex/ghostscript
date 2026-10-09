@@ -1560,6 +1560,21 @@ $(DD)fpng.dev : $(fpng_) $(GLD)page.dev $(GDEV) $(DEVS_MAK) $(MAKEDIRS)
 	$(SETPDEV2) $(DD)fpng $(fpng_)
 	$(ADDMOD) $(DD)fpng $(fpng_i_)
 
+### ------------------------------ SVG writer ----------------------------- ###
+
+svg_=$(DEVOBJ)gdevsvg.$(OBJ) $(DEVOBJ)doc_common.$(OBJ)
+
+$(DD)svg.dev : $(ECHOGS_XE) $(svg_) $(libpng_dev) $(GLD)vector.dev $(GDEV) \
+ $(DEVS_MAK) $(MAKEDIRS)
+	$(SETDEV2) $(DD)svg $(svg_)
+	$(ADDMOD) $(DD)svg -include $(GLD)vector $(png_i_)
+
+$(DEVOBJ)gdevsvg.$(OBJ) : $(DEVVECSRC)gdevsvg.c $(GDEV) $(gdevvec_h) \
+ $(gxpath_h) $(gzpath_h) $(gzcpath_h) $(gxgstate_h) $(gxdcolor_h) $(gxfont_h) \
+ $(gxtext_h) $(gxchar_h) $(gxdevsop_h) $(png__h) $(DEVVECSRC)doc_common.h \
+ $(DEVS_MAK) $(MAKEDIRS)
+	$(CC_) $(I_)$(DEVI_) $(II)$(PI_)$(_I) $(PCF_) $(GLF_) $(DEVO_)gdevsvg.$(OBJ) $(C_) $(DEVVECSRC)gdevsvg.c
+
 ### ---------------------- PostScript image format ---------------------- ###
 ### These devices make it possible to print monochrome Level 2 files on a ###
 ###   Level 1 printer, by converting them to a bitmap in PostScript       ###
