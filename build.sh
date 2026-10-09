@@ -51,7 +51,7 @@ CONFIGURE_FLAGS=(
   --host=wasm32-unknown-emscripten
   --build="$(./config.guess)"
   --with-exe-ext=.js
-  --with-drivers=FILES          # file-format devices: pdf/ps/png/jpeg/tiff/...
+  --with-drivers=FILES,svg      # file-format devices (pdf/ps/png/jpeg/tiff/...) + SVG
   --disable-threading           # no pthreads; single-threaded rendering
   --disable-contrib
   --disable-cups

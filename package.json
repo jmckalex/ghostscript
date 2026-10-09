@@ -19,9 +19,15 @@
   "scripts": {
     "build": "./build.sh",
     "clean": "./build.sh clean",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "demo": "node demo/serve.mjs",
+    "compare": "node tools/svg-compare.mjs"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "2.6.2",
+    "pngjs": "7.0.0"
   }
 }

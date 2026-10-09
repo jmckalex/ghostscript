@@ -1,0 +1,38 @@
+%!PS
+/f2 { << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> } def
+/box { 4 2 roll moveto 1 index 0 rlineto 0 exch rlineto neg 0 rlineto closepath } def
+% 1 axial, Extend both: fills the whole clip box
+gsave 30 640 140 120 box clip newpath
+<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [60 0 140 0] /Function f2 /Extend [true true] >> shfill grestore
+% 2 axial, no extend: only between the ends
+gsave 190 640 140 120 box clip newpath
+<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [220 0 300 0] /Function f2 /Extend [false false] >> shfill grestore
+% 3 axial, diagonal, stitched 3-colour CMYK function, extend one side
+gsave 350 640 140 120 box clip newpath
+<< /ShadingType 2 /ColorSpace /DeviceCMYK /Coords [350 640 490 760] /Extend [true false]
+   /Function << /FunctionType 3 /Domain [0 1] /Bounds [0.5] /Encode [0 1 0 1]
+     /Functions [ << /FunctionType 2 /Domain [0 1] /C0 [1 0 0 0] /C1 [0 1 0 0] /N 1 >>
+                  << /FunctionType 2 /Domain [0 1] /C0 [0 1 0 0] /C1 [0 0 1 0] /N 1 >> ] >> >> shfill grestore
+% 4 radial, concentric from 0
+gsave 30 470 140 140 box clip newpath
+<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [100 540 0 100 540 70] /Function f2 /Extend [true true] >> shfill grestore
+% 5 radial, offset focus, r0 > 0, extend end only
+gsave 190 470 140 140 box clip newpath
+<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [240 560 10 260 540 60] /Function f2 /Extend [false true] >> shfill grestore
+% 6 radial, non-nested circles (cone): falls back to raster
+gsave 350 470 140 140 box clip newpath
+<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [380 500 10 460 580 30] /Function f2 /Extend [false false] >> shfill grestore
+% 7 shading pattern filling a star
+<< /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 120 0] /Function f2 >> >>
+matrix makepattern setpattern
+gsave 30 300 translate newpath 60 0 moveto 4 { 144 rotate 60 0 lineto } repeat closepath
+gsave 60 60 translate fill grestore grestore
+% 8 Gouraud mesh (type 4): raster fallback
+gsave 190 300 140 140 box clip newpath
+<< /ShadingType 4 /ColorSpace /DeviceRGB /DataSource [0 190 300 1 0 0  0 330 300 0 1 0  0 260 440 0 0 1] >> shfill grestore
+% 9 text with a gradient fill
+/Helvetica-Bold findfont 48 scalefont setfont
+<< /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [350 0 490 0] /Function f2 >> >>
+matrix makepattern setpattern
+350 330 moveto (Grad) show
+showpage

@@ -1,0 +1,40 @@
+%!PS
+% Edit me: the page is re-rendered as SVG as you type.
+
+% A radial shading for the background (becomes an SVG radialGradient)
+<< /ShadingType 3 /ColorSpace /DeviceRGB /Extend [true true]
+   /Coords [306 520 0 306 520 420]
+   /Function << /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [0.82 0.88 1] /N 1 >>
+>> shfill
+
+% A rosette of rotated text: every glyph is drawn with <use> of one
+% shared outline, and the text stays selectable.
+/Helvetica-Bold findfont 22 scalefont setfont
+gsave 306 520 translate
+0 20 340 {
+  dup rotate
+  dup 360 div 0.85 0.75 sethsbcolor
+  72 -8 moveto (Ghostscript) show
+  neg rotate
+} for
+grestore
+
+% Title, with a gradient fill
+<< /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB
+     /Coords [140 0 470 0] /Extend [true true]
+     /Function << /FunctionType 2 /Domain [0 1] /C0 [0.9 0.2 0.4] /C1 [0.2 0.3 0.9] /N 1 >> >>
+>> matrix makepattern setpattern
+/Times-Bold findfont 46 scalefont setfont
+(PostScript to SVG) dup stringwidth pop 612 exch sub 2 div 190 moveto show
+
+% Strokes with dashes, caps and joins
+0.2 setgray 3 setlinewidth [9 5] 0 setdash 1 setlinecap
+90 150 moveto 522 150 lineto stroke
+[] 0 setdash 1 setlinejoin 0.85 0.3 0.1 setrgbcolor
+90 100 moveto 150 130 lineto 210 100 lineto 270 130 lineto 330 100 lineto
+390 130 lineto 450 100 lineto 522 130 lineto stroke
+
+/Helvetica findfont 12 scalefont setfont 0.3 setgray
+(Rendered by Ghostscript compiled to WebAssembly, with its svg device.)
+dup stringwidth pop 612 exch sub 2 div 60 moveto show
+showpage

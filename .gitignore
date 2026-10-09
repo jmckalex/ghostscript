@@ -18,3 +18,4 @@ src/ghostscript-*/obj/
 src/ghostscript-*/soobj/
 src/ghostscript-*/debugobj/
 src/ghostscript-*/auxtmp*/
+build/

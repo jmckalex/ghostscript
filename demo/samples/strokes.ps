@@ -1,0 +1,25 @@
+%!PS
+/zig { moveto 40 60 rlineto 40 -60 rlineto 40 60 rlineto } def
+0 1 2 { /j exch def
+  0 1 2 { /c exch def
+    gsave 12 setlinewidth j setlinejoin c setlinecap
+    c 3 mul j add 0.1 mul 0.3 0.7 setrgbcolor
+    40 c 180 mul add 640 j 50 mul sub zig stroke
+    0 setgray 0 setlinewidth 40 c 180 mul add 640 j 50 mul sub zig stroke grestore
+  } for
+} for
+% miter limit: sharp angle with limit 2 (bevels) and 20 (miters)
+gsave 10 setlinewidth 2 setmiterlimit 60 420 moveto 100 440 lineto 60 460 lineto stroke grestore
+gsave 10 setlinewidth 20 setmiterlimit 160 420 moveto 200 440 lineto 160 460 lineto stroke grestore
+% dashes with offset
+gsave 4 setlinewidth [20 10 5 10] 7 setdash 260 440 moveto 560 440 lineto stroke grestore
+gsave 6 setlinewidth 1 setlinecap [0 12] 0 setdash 260 410 moveto 560 410 lineto stroke grestore
+% non-uniform scale: the pen is an ellipse
+gsave 120 260 translate 4 1 scale 0 0 20 0 360 arc closepath 3 setlinewidth 0 0 1 setrgbcolor stroke grestore
+% rotated and skewed dashed rectangle
+gsave 380 260 translate 20 rotate [1 0 0.5 1 0 0] concat 2 setlinewidth [8 4] 0 setdash
+  -80 -40 160 80 rectstroke grestore
+% hairlines and curves
+gsave 0 setlinewidth 0 0.5 0 setrgbcolor 40 100 moveto 150 220 250 0 360 120 curveto stroke grestore
+gsave 0.25 setlinewidth 40 80 moveto 560 80 lineto stroke grestore
+showpage

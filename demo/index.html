@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghostscript SVG</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --ink: #1d2330;
+    --muted: #677085;
+    --line: #dde1e8;
+    --accent: #3d5afe;
+    --accent-ink: #ffffff;
+    --error: #c62828;
+    --ok: #2e7d32;
+    --code-bg: #fbfbfd;
+    --page-shadow: 0 1px 3px rgba(20, 30, 60, .12), 0 8px 24px rgba(20, 30, 60, .08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171e;
+      --panel: #1c2029;
+      --ink: #e6e9ef;
+      --muted: #98a1b3;
+      --line: #2c3240;
+      --accent: #7c8cff;
+      --accent-ink: #0d1020;
+      --error: #ff6b6b;
+      --ok: #66bb6a;
+      --code-bg: #171a22;
+      --page-shadow: 0 1px 3px rgba(0, 0, 0, .5), 0 8px 24px rgba(0, 0, 0, .35);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .status {
+    margin-left: auto; font-size: 12.5px; color: var(--muted);
+    display: flex; align-items: center; gap: 6px; white-space: nowrap;
+  }
+  .status::before {
+    content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
+  }
+  .status.ready::before { background: var(--ok); }
+  .status.busy::before { background: var(--accent); animation: pulse 1s infinite; }
+  .status.error::before { background: var(--error); }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  main { flex: 1; display: grid; grid-template-columns: minmax(320px, 42%) 1fr; min-height: 0; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+
+  .pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .source { border-right: 1px solid var(--line); background: var(--panel); }
+  @media (max-width: 860px) { .source { border-right: 0; border-bottom: 1px solid var(--line); min-height: 50vh; } }
+
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; border-bottom: 1px solid var(--line);
+  }
+  select, button, .button {
+    font: inherit; font-size: 13px; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  label.check { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; color: var(--muted); cursor: pointer; }
+  .spacer { flex: 1; }
+
+  .editor-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
+  textarea {
+    flex: 1; width: 100%; resize: none; border: 0; outline: none; padding: 12px 14px;
+    background: var(--code-bg); color: var(--ink);
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; tab-size: 4;
+  }
+  .binary {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    flex-direction: column; gap: 6px; background: var(--code-bg); color: var(--muted); text-align: center; padding: 24px;
+  }
+  .binary strong { color: var(--ink); }
+  .editor-wrap.is-binary .binary { display: flex; }
+  .drop .editor-wrap::after {
+    content: "Drop a PostScript, EPS or PDF file"; position: absolute; inset: 8px;
+    border: 2px dashed var(--accent); border-radius: 10px; display: flex; align-items: center;
+    justify-content: center; background: color-mix(in srgb, var(--panel) 85%, transparent); font-weight: 600;
+  }
+
+  details.log { border-top: 1px solid var(--line); }
+  details.log summary { padding: 6px 12px; cursor: pointer; color: var(--muted); font-size: 12.5px; }
+  details.log pre {
+    margin: 0; max-height: 28vh; overflow: auto; padding: 8px 12px 12px; font-size: 11.5px;
+    white-space: pre-wrap; word-break: break-word; color: var(--muted);
+  }
+
+  .output .toolbar { background: var(--panel); }
+  .stats { color: var(--muted); font-size: 12.5px; }
+  .viewer { flex: 1; overflow: auto; padding: 24px 16px 48px; }
+  .pages { display: flex; flex-direction: column; align-items: center; gap: 28px; }
+  .page { display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
+  .page-head { display: flex; gap: 10px; align-items: baseline; font-size: 12px; color: var(--muted); }
+  .page-head a { color: var(--accent); text-decoration: none; }
+  .page-head a:hover { text-decoration: underline; }
+  .sheet { background: #fff; box-shadow: var(--page-shadow); line-height: 0; max-width: 100%; overflow: auto; }
+  .sheet svg { display: block; height: auto; }
+  .show-text .sheet text { fill: #e0245e; fill-opacity: .45; }
+  .empty { color: var(--muted); text-align: center; margin-top: 15vh; }
+  .error-banner {
+    margin: 0 auto 16px; max-width: 760px; padding: 10px 12px; border-radius: 8px;
+    color: var(--error); border: 1px solid color-mix(in srgb, var(--error) 40%, transparent);
+    background: color-mix(in srgb, var(--error) 8%, transparent); font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Ghostscript → SVG</h1>
+  <span class="sub">PostScript, EPS and PDF to vector SVG, in your browser</span>
+  <span id="status" class="status">Loading Ghostscript…</span>
+</header>
+<main>
+  <section class="pane source" id="source">
+    <div class="toolbar">
+      <select id="sample" aria-label="Sample"></select>
+      <button id="open">Open file…</button>
+      <input id="file" type="file" accept=".ps,.eps,.epsf,.ai,.pdf,application/pdf,application/postscript" hidden>
+      <span class="spacer"></span>
+      <label class="check"><input type="checkbox" id="live" checked> Live</label>
+      <button id="render" class="primary" title="Render (⌘/Ctrl+Enter)">Render</button>
+    </div>
+    <div class="editor-wrap" id="editor-wrap">
+      <textarea id="editor" spellcheck="false" wrap="off" aria-label="PostScript source"></textarea>
+      <div class="binary"><strong id="binary-name"></strong><span id="binary-info"></span></div>
+    </div>
+    <details class="log" id="log-box">
+      <summary>Ghostscript output</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+  <section class="pane output">
+    <div class="toolbar">
+      <label class="check" title="Show the invisible text layer used for selection and search">
+        <input type="checkbox" id="show-text"> Show text layer</label>
+      <label class="check"><input type="checkbox" id="text-layer" checked> Text layer</label>
+      <label class="check"><input type="checkbox" id="reuse" checked> Reuse glyphs</label>
+      <span class="spacer"></span>
+      <span class="stats" id="stats"></span>
+      <select id="zoom" aria-label="Zoom">
+        <option value="0.5">50%</option><option value="0.75">75%</option>
+        <option value="1" selected>100%</option><option value="1.5">150%</option>
+        <option value="2">200%</option><option value="4">400%</option>
+      </select>
+    </div>
+    <div class="viewer" id="viewer"><div class="pages" id="pages"><p class="empty">Rendering…</p></div></div>
+  </section>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>
