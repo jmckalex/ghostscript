@@ -1,0 +1,20 @@
+dist/
+build.log
+node_modules/
+__pycache__/
+.DS_Store
+
+# Ghostscript in-tree build products
+src/ghostscript-*/Makefile
+src/ghostscript-*/config.log
+src/ghostscript-*/config.status
+src/ghostscript-*/configaux.log
+src/ghostscript-*/a.wasm
+src/ghostscript-*/arch-config/
+src/ghostscript-*/tiff-config/
+src/ghostscript-*/auxflags.mak
+src/ghostscript-*/bin/
+src/ghostscript-*/obj/
+src/ghostscript-*/soobj/
+src/ghostscript-*/debugobj/
+src/ghostscript-*/auxtmp*/

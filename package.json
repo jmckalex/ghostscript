@@ -1,0 +1,27 @@
+{
+  "name": "ghostscript-wasm",
+  "version": "10.8.0",
+  "private": true,
+  "description": "Ghostscript 10.08.0 compiled to WebAssembly with Emscripten",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "exports": {
+    ".": "./dist/ghostscript.mjs",
+    "./gs.js": "./dist/gs.js",
+    "./gs.wasm": "./dist/gs.wasm"
+  },
+  "bin": {
+    "gs-wasm": "./dist/gs-cli.mjs"
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "./build.sh",
+    "clean": "./build.sh clean",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
