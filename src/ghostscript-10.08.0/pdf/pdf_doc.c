@@ -1883,7 +1883,14 @@ int pdfi_doc_trailer(pdf_context *ctx)
             goto exit;
     }
 
-    if (ctx->device_state.writepdfmarks) {
+    if (ctx->device_state.writepdfmarks && ctx->device_state.WantsLinkPdfmarks) {
+        /* Only the document information, for a device that wants links */
+        code = pdfi_doc_Info(ctx);
+        if (code < 0) {
+            if ((code = pdfi_set_warning_stop(ctx, code, NULL, W_PDF_BAD_INFO, "pdfi_doc_trailer", NULL)) < 0)
+                goto exit;
+        }
+    } else if (ctx->device_state.writepdfmarks) {
         /* Handle Outlines */
         code = pdfi_doc_Outlines(ctx);
         if (code < 0) {

@@ -155,6 +155,10 @@ void pdfi_device_set_flags(pdf_context *ctx)
     ctx->device_state.ForOPDFRead = pdfi_device_check_param_bool(dev, "ForOPDFRead");
     ctx->device_state.WantsPageLabels = pdfi_device_check_param_bool(dev, "WantsPageLabels");
     ctx->device_state.WantsOptionalContent = pdfi_device_check_param_bool(dev, "WantsOptionalContent");
+    ctx->device_state.WantsLinkPdfmarks = pdfi_device_check_param_bool(dev, "WantsLinkPdfmarks");
+    ctx->device_state.WantsVisibleOptionalContent =
+        !ctx->device_state.WantsOptionalContent &&
+        pdfi_device_check_param_bool(dev, "WantsVisibleOptionalContent");
     ctx->device_state.PassUserUnit = pdfi_device_check_param_bool(dev, "PassUserUnit");
 
     /* See if it is a DeviceN (spot capable) */
@@ -167,7 +171,9 @@ void pdfi_device_set_flags(pdf_context *ctx)
     if (ctx->device_state.writepdfmarks) {
         if (gx_outputfile_is_separate_pages(((gx_device_vector *)dev)->fname, dev->memory) || ctx->device_state.ModifiesPageOrder) {
             ctx->args.no_pdfmark_outlines = true;
-            ctx->args.no_pdfmark_dests = true;
+            /* A device that wants link pdfmarks links its pages itself */
+            if (!ctx->device_state.WantsLinkPdfmarks)
+                ctx->args.no_pdfmark_dests = true;
         }
     }
 

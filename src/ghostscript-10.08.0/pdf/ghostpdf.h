@@ -308,6 +308,15 @@ typedef struct device_state_s {
     bool WantsPageLabels;
     /* Is the device capable of handling optional content */
     bool WantsOptionalContent;
+    /* A device that draws every annotation itself and wants Link annotations
+     * as pdfmarks too (with destinations on other pages, even when each page
+     * goes to a file of its own), and no other document-level pdfmarks than
+     * DOCINFO.  The svg device: links become <a> elements. */
+    bool WantsLinkPdfmarks;
+    /* A device that wants hidden optional content culled, as usual, and the
+     * visible optional content bracketed by OC BDC / EMC pdfmarks (and no
+     * other marked content).  The svg device: OCGs become layers. */
+    bool WantsVisibleOptionalContent;
     bool PassUserUnit;
     bool ModifiesPageSize;
     bool ModifiesPageOrder;
@@ -375,6 +384,8 @@ typedef struct pdf_context_s
     void *OFFlevels;
     uint64_t BMClevel;
     bool BDCWasOC;
+    /* WantsVisibleOptionalContent: the levels (up to 64) whose BDC was sent */
+    uint64_t OCMarkLevels;
 
     /* Bitfields recording whether any errors or warnings were encountered */
     char pdf_errors[PDF_ERROR_BYTE_SIZE];

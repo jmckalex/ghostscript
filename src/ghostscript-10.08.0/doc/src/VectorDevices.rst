@@ -90,7 +90,7 @@ SVG output
 
 The :title:`svg` device writes each page as a standalone SVG (Scalable Vector Graphics) file, which web browsers display directly and which can be enlarged without loss. Wherever SVG can express the content of the page, the device writes it as SVG, rather than as pixels:
 
-- Fills, strokes and clipping paths are written as SVG paths, at the full precision of the graphics library. Strokes keep their dash patterns, line caps and joins, miter limits and line widths, including the uneven widths that a skewed transformation gives. Zero-width lines are drawn one screen pixel wide at any magnification.
+- Fills, strokes and clipping paths are written as SVG paths, at the full precision of the graphics library. Strokes keep their dash patterns, line caps and joins, miter limits and line widths, including the uneven widths that a skewed transformation gives. Zero-width lines are drawn one screen pixel wide at any magnification. A PDF fill-and-stroke under transparency (``B``) is drawn as PDF specifies, as a knockout group: where the stroke paints, it replaces the fill rather than being composited over it.
 
 - Text set in Type 1, CFF, TrueType and CID-keyed fonts is drawn from the glyph outlines in the fonts, without hinting. Each glyph used on a page is defined once and drawn wherever it appears with an SVG ``<use>`` element, which keeps text-heavy pages small. The glyphs of Type 3 fonts are drawn by the fonts' own procedures, as ordinary paths and images.
 
@@ -98,13 +98,19 @@ The :title:`svg` device writes each page as a standalone SVG (Scalable Vector Gr
 
 - Images are decoded by Ghostscript, whatever their colour space, ``Decode`` array and masking, and embedded as PNG at their own resolution. Only an image with much more resolution than the device is reduced. Images which are enlarged and not interpolated (``/Interpolate false``) are displayed with sharp pixel edges rather than blurred.
 
+- A JPEG (``DCTDecode``) image in DeviceGray or DeviceRGB is embedded as its original compressed data, when its own header shows that a browser will display it as Ghostscript decodes it. An image drawn more than once on a page is written once, and placed with ``<use>``.
+
 - Axial shadings (``ShadingType`` 2), and radial shadings (``ShadingType`` 3) whose starting circle lies inside the ending one, become SVG ``linearGradient`` and ``radialGradient`` elements, whether they are painted with ``shfill`` or used as a pattern to fill shapes, strokes or text.
+
+- Tiling patterns (``PatternType`` 1), colored and uncolored, become SVG ``pattern`` elements, whatever they fill or stroke, text included. Each cell is drawn once and tiled exactly as the pattern's matrix and steps specify; cells larger than their step overlap as they should.
 
 - PDF transparency is written as SVG: constant opacity becomes SVG opacity, blend modes become ``mix-blend-mode``, transparency groups become groups with their opacity and isolation, and soft masks (luminosity or alpha, with their backdrop colours and transfer functions) become SVG masks.
 
-Content which SVG cannot express, or which the device does not translate, is rendered by the graphics library and embedded as a PNG image in its place in the painting order, so that the page is always complete. This applies to function-based and mesh shadings (``ShadingType`` 1 and 4 to 7), radial shadings whose circles are not nested (cones, for example), tiling patterns, raster operations (from PCL), and images with explicit masks (``ImageType`` 3). The device resolution applies only to these images; everything else is independent of resolution.
+- Links become ``<a>`` elements over the page: PDF Link annotations, and the ``/ANN`` and ``/LNK`` pdfmarks of a PostScript program. A link to a web address keeps it; a link to another page goes to that page's file. The document information (Title, Author, Subject and Keywords, or a ``/DOCINFO`` pdfmark) becomes the file's ``<title>`` and Dublin Core ``<metadata>``. Each visible optional content group (a PDF "layer") becomes a group named for it, an Inkscape layer; hidden ones are not drawn.
 
-Colours are converted to RGB by Ghostscript's colour management, as they are for RGB raster devices. Spot colours, and the PDF content which does not mark the page (hyperlinks, bookmarks, form fields and metadata), are not carried into the SVG.
+Content which SVG cannot express, or which the device does not translate, is rendered by the graphics library and embedded as a PNG image in its place in the painting order, so that the page is always complete. This applies to function-based and mesh shadings (``ShadingType`` 1 and 4 to 7), radial shadings whose circles are not nested (cones, for example), raster operations (from PCL), and images with explicit masks (``ImageType`` 3). The device resolution applies only to these images; everything else is independent of resolution.
+
+Colours are converted to RGB by Ghostscript's colour management, as they are for RGB raster devices. Spot colours are not kept as such, and of the PDF content that doesn't mark the page, only links, the document information and optional content groups are carried into the SVG (not bookmarks, form fields or other annotations' data; every annotation that has an appearance is drawn).
 
 Usage
 ~~~~~~~~~~~~
@@ -130,6 +136,15 @@ Options
 ``-dSVGTransparency=true | false (default is true)``
    Write PDF transparency as SVG. With ``false``, Ghostscript's own transparency compositor flattens each page that uses transparency, and the result is embedded as an image.
 
+``-dSVGPassThroughJPEG=true | false (default is true)``
+   Embed JPEG images as their original data. With ``false``, they are decoded and written as PNG like other images.
+
+``-dSVGLinks=true | false (default is true)``
+   Write links as ``<a>`` elements.
+
+``-dSVGLayers=true | false (default is true)``
+   Write optional content groups as named groups (Inkscape layers).
+
 ``-r``\ *res* (default is 192)
    The resolution, in dots per inch, of the images into which content that SVG cannot express is rendered. It has no effect on paths, text, images or gradients.
 
@@ -138,7 +153,9 @@ Using the output
 
 The files are SVG 1.1, together with a few features of SVG 2 and CSS which current web browsers support: ``mix-blend-mode``, ``isolation`` and ``mask-type`` for transparency, the ``fr`` attribute for radial shadings whose starting circle has a radius and is off centre, ``vector-effect`` for zero-width lines, and ``image-rendering`` for sharp image pixels. Other SVG renderers may not support all of these, and their rendering of the affected content will then differ.
 
-The identifiers of the definitions in a file (glyphs, clipping paths, gradients and masks) are unique only within that file. To place several pages directly in one HTML document, give each page's identifiers a distinct prefix. A browser displays an SVG file in an ``<img>`` element as a picture, without selectable text; to keep the text selectable, place the SVG in the document itself or use an ``<object>`` or ``<iframe>`` element.
+The identifiers of the definitions in a file (glyphs, clipping paths, gradients, patterns, images and masks) are unique only within that file. To place several pages directly in one HTML document, give each page's identifiers a distinct prefix. A browser displays an SVG file in an ``<img>`` element as a picture, without selectable text; to keep the text selectable and the links working, place the SVG in the document itself or use an ``<object>`` or ``<iframe>`` element.
+
+Links to other pages name their files from the output file name, so they work when the files stay together. A PostScript program that looks for the ``pdfmark`` operator before using it (as ``/pdfmark where`` does) won't find it with this device, which isn't a distiller; to have such a program's links, define it first: ``-c "userdict /pdfmark systemdict /pdfmark get put" -f input.ps``.
 
 
 The family of PDF and PostScript output devices

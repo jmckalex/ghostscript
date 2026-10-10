@@ -4429,9 +4429,15 @@ static int pdfi_annot_preserve_mark(pdf_context *ctx, pdf_dict *annot, pdf_name 
             if (code < 0) goto exit;
         } else {
             if (pdfi_name_is(Key, "AP")) {
-                /* Special handling for AP -- have fun! */
-                code = pdfi_annot_preserve_modAP(ctx, tempdict, Key);
-                if (code < 0) goto exit;
+                if (ctx->device_state.WantsLinkPdfmarks) {
+                    /* The annotation is drawn as well: just the link */
+                    code = pdfi_dict_delete_pair(ctx, tempdict, Key);
+                    if (code < 0) goto exit;
+                } else {
+                    /* Special handling for AP -- have fun! */
+                    code = pdfi_annot_preserve_modAP(ctx, tempdict, Key);
+                    if (code < 0) goto exit;
+                }
             } else if (pdfi_name_is(Key, "QuadPoints")) {
                 code = pdfi_annot_preserve_modQP(ctx, tempdict, Key);
                 if (code < 0) goto exit;
@@ -4601,7 +4607,13 @@ static int pdfi_annot_handle(pdf_context *ctx, pdf_dict *annot)
         goto exit;
     }
 
-    if (ctx->args.preserveannots && ctx->device_state.annotations_preserved)
+    if (ctx->device_state.WantsLinkPdfmarks) {
+        /* Every annotation is drawn; a link is also sent as a pdfmark. */
+        if (ctx->args.preserveannots && pdfi_name_is(Subtype, "Link"))
+            code = pdfi_annot_preserve_mark(ctx, annot, Subtype);
+        if (code >= 0)
+            code = pdfi_annot_draw(ctx, annot, Subtype);
+    } else if (ctx->args.preserveannots && ctx->device_state.annotations_preserved)
         code = pdfi_annot_preserve(ctx, annot, Subtype);
     else
         code = pdfi_annot_draw(ctx, annot, Subtype);

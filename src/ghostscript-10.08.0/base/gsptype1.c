@@ -341,6 +341,9 @@ gs_pattern1_make_pattern(gs_client_color * pcc,
                    inst.size.x, inst.size.y);
         if_debug4m('t', mem, "[t]bbox=(%g,%g),(%g,%g)\n",
                    bbox.p.x, bbox.p.y, bbox.q.x, bbox.q.y);
+    } else if (dev_proc(pgs->device, dev_spec_op)(pgs->device,
+                                    gxdso_pattern_exact_matrix, NULL, 0) > 0) {
+        /* No adjustment: the device writes the pattern as vectors. */
     } else if ((ADJUST_AS_ADOBE) && (inst.templat.TilingType != 2)) {
         if (inst.step_matrix.xy == 0 && inst.step_matrix.yx == 0 &&
             fabs(inst.step_matrix.xx - bbw) < 0.5 &&
@@ -640,10 +643,14 @@ adjust_bbox_to_pixel_origin(gs_pattern1_instance_t *pinst, gs_rect *pbbox)
     int code = 0;
 
     /*
-     * Adjust saved.ctm to map the bbox origin to pixels.
+     * Adjust saved.ctm to map the bbox origin to pixels (unless the device
+     * wants the pattern's true position: see gxdso_pattern_exact_matrix).
      */
     dx = pbbox->p.x - floor(pbbox->p.x + 0.5);
     dy = pbbox->p.y - floor(pbbox->p.y + 0.5);
+    if (saved->device && dev_proc(saved->device, dev_spec_op)(saved->device,
+                                    gxdso_pattern_exact_matrix, NULL, 0) > 0)
+        dx = dy = 0;
     if (dx != 0 || dy != 0) {
         pbbox->p.x -= dx;
         pbbox->p.y -= dy;

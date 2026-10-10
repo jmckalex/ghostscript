@@ -573,6 +573,7 @@ int pdfi_oc_init(pdf_context *ctx)
     int code;
 
     ctx->BMClevel = 0;
+    ctx->OCMarkLevels = 0;
     if (ctx->OFFlevels) {
         pdfi_oc_levels_free(ctx, ctx->OFFlevels);
         ctx->OFFlevels = NULL;
@@ -601,7 +602,8 @@ int pdfi_op_MP(pdf_context *ctx)
     if (pdfi_count_stack(ctx) < 1)
         return_error(gs_error_stackunderflow);
 
-    if (!ctx->device_state.writepdfmarks || !ctx->args.preservemarkedcontent) {
+    if (!ctx->device_state.writepdfmarks || !ctx->args.preservemarkedcontent ||
+        ctx->device_state.WantsVisibleOptionalContent) {
         pdfi_pop(ctx, 1);
         goto exit;
     }
@@ -634,7 +636,8 @@ int pdfi_op_DP(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict)
         return gs_note_error(gs_error_stackunderflow);
     }
 
-    if (!ctx->device_state.writepdfmarks || !ctx->args.preservemarkedcontent) {
+    if (!ctx->device_state.writepdfmarks || !ctx->args.preservemarkedcontent ||
+        ctx->device_state.WantsVisibleOptionalContent) {
         pdfi_pop(ctx, 2); /* pop args */
         goto exit;
     }
@@ -700,7 +703,8 @@ int pdfi_op_BMC(pdf_context *ctx)
     if (pdfi_count_stack(ctx) < 1)
         return_error(gs_error_stackunderflow);
 
-    if (!ctx->device_state.writepdfmarks || !ctx->args.preservemarkedcontent) {
+    if (!ctx->device_state.writepdfmarks || !ctx->args.preservemarkedcontent ||
+        ctx->device_state.WantsVisibleOptionalContent) {
         /* Need to increment the BMCLevel anyway, as the EMC will count it down.
          * If we already have a BDC, then that effectively will turn it on.
          */
@@ -760,7 +764,9 @@ int pdfi_op_BDC(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict)
     if (!pdfi_name_is(tag, "OC"))
         ctx->BDCWasOC = false;
 
-    if (ctx->device_state.writepdfmarks && ctx->args.preservemarkedcontent && (!ctx->BDCWasOC || ctx->device_state.WantsOptionalContent)) {
+    if (ctx->device_state.writepdfmarks && ctx->args.preservemarkedcontent &&
+        !ctx->device_state.WantsVisibleOptionalContent &&
+        (!ctx->BDCWasOC || ctx->device_state.WantsOptionalContent)) {
         objarray = (pdf_obj **)gs_alloc_bytes(ctx->memory, 2 * sizeof(pdf_obj *), "pdfi_op_BDC");
         if (objarray == NULL) {
             code = gs_note_error(gs_error_VMerror);
@@ -859,6 +865,32 @@ int pdfi_op_BDC(pdf_context *ctx, pdf_dict *stream_dict, pdf_dict *page_dict)
         ocg_is_visible = pdfi_oc_is_ocg_visible(ctx, oc_dict);
         if (!ocg_is_visible)
             code = pdfi_oc_levels_set(ctx, ctx->OFFlevels, ctx->BMClevel);
+        else if (ctx->device_state.WantsVisibleOptionalContent && ctx->device_state.writepdfmarks &&
+                 ctx->args.preservemarkedcontent && !pdfi_oc_is_off(ctx) && ctx->BMClevel < 64 &&
+                 pdfi_dict_entries(oc_dict) > 0) {
+            /* Visible: bracket it for the device, which wants to know its
+               optional content group, as /OC {label} BDC ... EMC. */
+            objarray = (pdf_obj **)gs_alloc_bytes(ctx->memory, 2 * sizeof(pdf_obj *), "pdfi_op_BDC");
+            if (objarray == NULL) {
+                code = gs_note_error(gs_error_VMerror);
+                goto exit;
+            }
+            code = pdfi_pdfmark_dict(ctx, oc_dict);
+            if (code < 0)
+                goto exit;
+            code = pdfi_object_alloc(ctx, PDF_INDIRECT, 0, (pdf_obj **)&dictref);
+            if (code < 0)
+                goto exit;
+            pdfi_countup(dictref);
+            dictref->ref_object_num = oc_dict->object_num;
+            dictref->ref_generation_num = oc_dict->generation_num;
+            dictref->is_marking = true;
+            objarray[0] = (pdf_obj *)tag;
+            objarray[1] = (pdf_obj *)dictref;
+            code = pdfi_pdfmark_from_objarray(ctx, objarray, 2, NULL, "BDC");
+            if (code >= 0)
+                ctx->OCMarkLevels |= (uint64_t)1 << ctx->BMClevel;
+        }
 
     }
 
@@ -877,7 +909,13 @@ int pdfi_op_EMC(pdf_context *ctx)
 {
     int code, code1 = 0;
 
-    if (ctx->device_state.writepdfmarks && ctx->args.preservemarkedcontent && (!ctx->BDCWasOC || ctx->device_state.WantsOptionalContent))
+    if (ctx->device_state.WantsVisibleOptionalContent) {
+        /* Only for the levels whose BDC was sent */
+        if (ctx->BMClevel < 64 && (ctx->OCMarkLevels & ((uint64_t)1 << ctx->BMClevel))) {
+            ctx->OCMarkLevels &= ~((uint64_t)1 << ctx->BMClevel);
+            code1 = pdfi_pdfmark_from_objarray(ctx, NULL, 0, NULL, "EMC");
+        }
+    } else if (ctx->device_state.writepdfmarks && ctx->args.preservemarkedcontent && (!ctx->BDCWasOC || ctx->device_state.WantsOptionalContent))
         code1 = pdfi_pdfmark_from_objarray(ctx, NULL, 0, NULL, "EMC");
 
     code = pdfi_oc_levels_clear(ctx, ctx->OFFlevels, ctx->BMClevel);

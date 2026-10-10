@@ -1749,6 +1749,11 @@ pattern_accum_dev_spec_op(gx_device *dev, int dso, void *data, int size)
 
     if (dso == gxdso_in_pattern_accumulator)
         return (pinst->templat.PaintType == 2 ? 2 : 1);
+    /* The tile is drawn into a raster buffer, which can't take high level
+       colors, whatever the device beneath says: otherwise rectfill, asked
+       whether to use fill_rectangle_hl_color, would get the target's yes. */
+    if (dso == gxdso_supports_hlcolor)
+        return 0;
     if (dso == gxdso_get_dev_param) {
         dev_param_req_t *request = (dev_param_req_t *)data;
         gs_param_list * plist = (gs_param_list *)request->list;

@@ -713,7 +713,7 @@ The :title:`txtwrite` device will output the text contained in the original docu
 SVG writer
 ~~~~~~~~~~~~~~~~~~~~
 
-The :title:`svg` device outputs each page as a standalone SVG file, with vector paths, selectable text, gradients and transparency. See :ref:`SVG output<VectorDevices_SVG>`.
+The :title:`svg` device outputs each page as a standalone SVG file, with vector paths, selectable text, gradients, patterns, transparency, links and layers. See :ref:`SVG output<VectorDevices_SVG>`.
 
 
 .. _Devices_Display_Device:

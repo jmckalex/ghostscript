@@ -549,6 +549,17 @@ enum {
 
     gxdso_set_srcgtag,
 
+    /* Does the device want tiling patterns' matrices exactly as given?
+     * makepattern normally bends a pattern's scale slightly so that its step
+     * is a whole number of device pixels, for tiling a rasterized cell.  A
+     * device that writes patterns as vector graphics, at any scale, wants
+     * the true matrix instead.
+     * data = NULL
+     * size = 0
+     * Returns 1 if so.
+     */
+    gxdso_pattern_exact_matrix,
+
     /* Add new gxdso_ keys above this. */
     gxdso_pattern__LAST
 };

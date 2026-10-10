@@ -18,9 +18,14 @@
    - glyphs of outline fonts are defined once per page as <path> elements
      and drawn with <use>, and an invisible, selectable Unicode text layer
      is placed over the page so text can be selected, searched and copied;
-   - anything SVG cannot express (exotic shadings and patterns, raster
-     operations, transparency groups rendered by the compositor, ...) is
-     rendered by the graphics library into an RGBA canvas at the device
+   - images are embedded as PNG at their own resolution (JPEGs as their
+     original data), once per page; axial and radial shadings become
+     gradients; tiling patterns become <pattern>s; PDF transparency becomes
+     opacity, blend modes, groups and masks;
+   - links, the document information and optional content groups (passed
+     as pdfmarks) become <a> elements, <title> and <metadata>, and layers;
+   - anything SVG cannot express (exotic shadings, raster operations, ...)
+     is rendered by the graphics library into an RGBA canvas at the device
      resolution, which is emitted as an embedded PNG image at the correct
      position in the painting order.
 
@@ -29,9 +34,12 @@
    independent.
 
    Device parameters:
-     -dSVGTextLayer=false     omit the invisible text layer
-     -dSVGReuseGlyphs=false   write every glyph as a plain path
-     -dSVGTransparency=false  let the pdf14 compositor flatten transparency
+     -dSVGTextLayer=false       omit the invisible text layer
+     -dSVGReuseGlyphs=false     write every glyph as a plain path
+     -dSVGTransparency=false    let the pdf14 compositor flatten transparency
+     -dSVGPassThroughJPEG=false decode JPEGs and write them as PNG
+     -dSVGLinks=false           no <a> elements
+     -dSVGLayers=false          no layers for optional content
 
    User documentation: doc/src/VectorDevices.rst, "SVG output".
 */
@@ -71,6 +79,10 @@
 #include "gxshade.h"
 #include "gstrans.h"
 #include "gxcomp.h"
+#include "gxcolor2.h"
+#include "gxpcolor.h"
+#include "gsicc_manage.h"
+#include "gxfmap.h"
 #include "png_.h"
 #include "doc_common.h"
 
@@ -407,6 +419,47 @@ typedef struct svg_text_run_s {
     svg_buf chars;              /* escaped UTF-8 text */
 } svg_text_run;
 
+/* A tiling pattern written as SVG (see "Tiling patterns" below). */
+typedef struct svg_pattern_s {
+    gx_bitmap_id id;            /* the pattern instance's id */
+    int tile;                   /* def id of its content, <g id="tN"> */
+    bool uncolored;             /* PaintType 2: content painted in currentColor */
+    gs_matrix pm;               /* pattern space -> page */
+    gs_rect bbox;
+    double xstep, ystep;        /* > 0 */
+} svg_pattern;
+
+/* A pattern being accumulated, and the state it interrupted. */
+typedef struct svg_pat_accum_s {
+    svg_pattern pat;
+    svg_buf content;
+    svg_buf *saved_out;
+    bool saved_clip_open;
+    gs_id saved_clip_id;
+    bool saved_text_invisible, saved_painting_glyph, saved_uncolored;
+    int saved_depth, saved_active_mask;
+    gs_gstate *pgs;             /* whose transparency state was reset */
+    float saved_fill_alpha, saved_stroke_alpha;
+    gs_blend_mode_t saved_blend_mode;
+} svg_pat_accum;
+#define SVG_MAX_PAT_DEPTH 8
+
+/* pdfmarks: an object defined by OBJ / .PUTDICT, by its label. */
+typedef struct svg_mark_obj_s {
+    char *label;
+    char *name;                 /* /Name (an OCG's), as escaped UTF-8 */
+    char *uri;                  /* /URI (a URI action's) */
+    char *ocgs;                 /* /OCGs (an OCMD's), as given */
+} svg_mark_obj;
+
+/* A layer <g> written and not yet closed, and where. */
+typedef struct svg_layer_s {
+    int serial;
+    svg_buf *out;
+    int depth, pat_depth;
+} svg_layer;
+#define SVG_MAX_MC 64
+
 /* A transparency group or soft mask level.  Level 0 is the page. */
 #define SVG_MAX_LEVELS 64
 typedef struct svg_level_s {
@@ -426,6 +479,7 @@ typedef struct gx_device_svg_s {
     /* Parameters */
     bool TextLayer;
     bool ReuseGlyphs;
+    bool PassThroughJPEG;
     /* Page content */
     svg_buf defs;               /* glyph outlines */
     svg_buf body;               /* painted content, in order */
@@ -443,6 +497,7 @@ typedef struct gx_device_svg_s {
     bool text_invisible;        /* rendering mode 3: text layer only */
     bool painting_glyph;        /* filling a glyph outline ourselves */
     bool pixelated;             /* page has unsmoothed (class "px") images */
+    int text_depth;             /* pat_depth when text_enum began */
     svg_text_run run;
     /* Transparency: nested groups and soft masks being written */
     bool Transparency;
@@ -450,6 +505,28 @@ typedef struct gx_device_svg_s {
     svg_level levels[SVG_MAX_LEVELS];
     int depth;
     int mask_depth;             /* > 0 while constructing a soft mask */
+    /* Tiling patterns: those written on this page, and those being written */
+    svg_pattern *patterns;
+    int npatterns, patterns_cap;
+    svg_pat_accum pat_stack[SVG_MAX_PAT_DEPTH];
+    int pat_depth;
+    bool pat_uncolored;         /* in an uncolored pattern: paint is currentColor */
+    /* pdfmarks (see "Links, metadata and layers") */
+    bool Links, Layers;         /* parameters SVGLinks, SVGLayers */
+    svg_buf links;              /* <a> elements for this page */
+    char *info[4];              /* Title, Author, Subject, Keywords (escaped) */
+    svg_mark_obj *objs;
+    int nobjs, objs_cap;
+    int mc[SVG_MAX_MC];         /* marked content open: the layer each began, or 0 */
+    int mc_depth;
+    svg_layer layers[SVG_MAX_MC];
+    int nlayers, next_layer;
+    bool page_has_layers;
+    /* JPEG pass-through: the compressed data of the image being drawn */
+    int pt_state;               /* SVG_PT_* */
+    int pt_serial;              /* the image it is for (svg_image_enum_t serial) */
+    int pt_next_serial;
+    svg_buf pt_data;
     /* Raster fallback canvas (RGBA, device resolution) */
     byte *canvas;
     int cx0, cy0, cx1, cy1;     /* dirty box, exclusive max; empty if cx0 >= cx1 */
@@ -487,12 +564,41 @@ static int svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitma
                           const gx_clip_path *pcpath);
 static dev_proc_fill_path(svg_fill_path);
 static dev_proc_stroke_path(svg_stroke_path);
+static dev_proc_fill_stroke_path(svg_fill_stroke_path);
 static dev_proc_fill_rectangle_hl_color(svg_fill_rectangle_hl_color);
 static dev_proc_text_begin(svg_text_begin);
 static dev_proc_fillpage(svg_fillpage);
 static dev_proc_dev_spec_op(svg_dev_spec_op);
 static dev_proc_begin_typed_image(svg_begin_typed_image);
 static dev_proc_composite(svg_composite);
+
+/* Glyphs of the text being shown are being drawn (not, say, the content of
+   a pattern accumulated while the text's color was being set). */
+#define SVG_TRACKING_GLYPHS(svg) \
+    ((svg)->text_enum && !(svg)->painting_glyph && (svg)->text_depth == (svg)->pat_depth)
+
+/* How an element is painted (see "Tiling patterns"). */
+#define SVG_INK_OTHER (-1)      /* not handled: rasterize */
+#define SVG_INK_NONE 0          /* paints nothing */
+#define SVG_INK_RGB 1
+#define SVG_INK_URL 2           /* a <pattern> */
+#define SVG_INK_CURRENT 3       /* currentColor, in an uncolored pattern */
+typedef struct svg_ink_s {
+    int kind;
+    gx_color_index color;       /* SVG_INK_RGB */
+    int def;                    /* SVG_INK_URL: <pattern id="pN"> */
+} svg_ink;
+static int svg_ink_of(gx_device_svg *svg, const gx_drawing_color *pdc,
+                      const gs_matrix *local, svg_ink *ink);
+static void svg_put_ink(svg_buf *b, const char *attr, const svg_ink *ink);
+static int svg_put_stencil(gx_device_svg *svg, const byte *png, size_t len, int gw, int gh,
+                           const gs_matrix *gm, bool pixelated, const svg_ink *ink,
+                           float opacity, gs_blend_mode_t blend_mode);
+static int svg_put_def(gx_device_svg *svg, const char *tag, char prefix, svg_buf *content);
+static int svg_encode_png(svg_buf *out, const byte *pix, int w, int h, int stride, int bpp,
+                          bool alpha);
+static int svg_begin_element(gx_device_svg *svg, const gx_clip_path *pcpath);
+static void svg_layers_close(gx_device_svg *svg, int min_depth);
 
 const gx_device_svg gs_svg_device = {
     svg_device_body("svg", svg_initialize_device_procs),
@@ -506,6 +612,9 @@ svg_initialize_device(gx_device *dev)
     svg->TextLayer = true;
     svg->ReuseGlyphs = true;
     svg->Transparency = true;
+    svg->PassThroughJPEG = true;
+    svg->Links = true;
+    svg->Layers = true;
     return 0;
 }
 
@@ -530,6 +639,7 @@ svg_initialize_device_procs(gx_device *dev)
     set_dev_proc(dev, get_page_device, gx_page_device_get_page_device);
     set_dev_proc(dev, fill_path, svg_fill_path);
     set_dev_proc(dev, stroke_path, svg_stroke_path);
+    set_dev_proc(dev, fill_stroke_path, svg_fill_stroke_path);
     set_dev_proc(dev, fill_rectangle_hl_color, svg_fill_rectangle_hl_color);
     set_dev_proc(dev, text_begin, svg_text_begin);
     set_dev_proc(dev, fillpage, svg_fillpage);
@@ -900,7 +1010,7 @@ svg_fill_mask(gx_device *dev, const byte *data, int data_x, int raster, gx_bitma
 {
     gx_device_svg *svg = (gx_device_svg *)dev;
 
-    if (svg->text_enum && !svg->painting_glyph && depth == 1 && w > 0 && h > 0) {
+    if (SVG_TRACKING_GLYPHS(svg) && depth == 1 && w > 0 && h > 0) {
         gs_rect box;
         int code;
 
@@ -912,6 +1022,46 @@ svg_fill_mask(gx_device *dev, const byte *data, int data_x, int raster, gx_bitma
     }
     if (svg->text_invisible)
         return 0;
+    if (depth == 1 && w > 0 && h > 0 && (svg->pat_uncolored || !gx_dc_is_pure(pdcolor))) {
+        svg_ink ink;
+        int code = svg_ink_of(svg, pdcolor, NULL, &ink);
+
+        if (code < 0)
+            return code;
+        if (ink.kind == SVG_INK_NONE)
+            return 0;
+        if (ink.kind == SVG_INK_URL || ink.kind == SVG_INK_CURRENT) {
+            /* The mask as an alpha image, painted through. */
+            byte *pix = gs_alloc_bytes(svg_mem(svg), (size_t)w * h * 4, "svg mask");
+            svg_buf png;
+            gs_matrix gm;
+            int i, j;
+
+            if (pix == NULL)
+                return_error(gs_error_VMerror);
+            for (j = 0; j < h; ++j)
+                for (i = 0; i < w; ++i) {
+                    byte *q = pix + ((size_t)j * w + i) * 4;
+                    int bit = data_x + i;
+
+                    q[0] = q[1] = q[2] = 0;
+                    q[3] = (data[j * raster + (bit >> 3)] >> (7 - (bit & 7))) & 1 ? 255 : 0;
+                }
+            gs_make_scaling(svg_sx(svg), svg_sy(svg), &gm);
+            gm.tx = x * svg_sx(svg);
+            gm.ty = y * svg_sy(svg);
+            sb_init(&png, svg_mem(svg));
+            code = svg_encode_png(&png, pix, w, h, w * 4, 4, true);
+            gs_free_object(svg_mem(svg), pix, "svg mask");
+            if (code >= 0)
+                code = svg_begin_element(svg, pcpath);
+            if (code >= 0)
+                code = svg_put_stencil(svg, (const byte *)png.data, png.len, w, h, &gm, false,
+                                       &ink, 1.0, BLEND_MODE_Normal);
+            sb_free(&png);
+            return code;
+        }
+    }
     return gx_default_fill_mask(dev, data, data_x, raster, id, x, y, w, h,
                                 pdcolor, depth, lop, pcpath);
 }
@@ -1070,6 +1220,127 @@ svg_put_png_image(gx_device_svg *svg, svg_buf *b, const byte *pix, int w, int h,
     return code;
 }
 
+/* Write an image's data once per page, as a definition, for a gw x gh grid
+   placed on the page by gm (grid -> page).  The definition's width and
+   height are its size on the page and *t gets the rest of the placement
+   (rotation, skew, position), so renderers resample the image at its final
+   size.  Returns the definition's id. */
+static int
+svg_image_def(gx_device_svg *svg, const char *mime, const byte *data, size_t len,
+              int gw, int gh, const gs_matrix *gm, gs_matrix *t)
+{
+    svg_buf d;
+    double ax = hypot(gm->xx, gm->xy), ay = hypot(gm->yx, gm->yy);
+    int id;
+
+    if (ax == 0 || ay == 0)
+        return_error(gs_error_undefinedresult);
+    *t = *gm;
+    t->xx /= ax; t->xy /= ax;
+    t->yx /= ay; t->yy /= ay;
+    sb_init(&d, svg_mem(svg));
+    sb_puts(&d, " width=\"");
+    sb_num(&d, gw * ax, 3);
+    sb_puts(&d, "\" height=\"");
+    sb_num(&d, gh * ay, 3);
+    sb_printf(&d, "\" preserveAspectRatio=\"none\" xlink:href=\"data:%s;base64,", mime);
+    sb_base64(&d, data, len);
+    sb_puts(&d, "\"/>");
+    id = svg_put_def(svg, "image", 'i', &d);
+    sb_free(&d);
+    return id;
+}
+
+/* Append the placement svg_image_def returned: x and y, or a transform. */
+static void
+svg_put_placement(svg_buf *b, const gs_matrix *t)
+{
+    if (fabs(t->xx - 1) < 1e-6 && fabs(t->yy - 1) < 1e-6 &&
+        fabs(t->xy) < 1e-6 && fabs(t->yx) < 1e-6) {
+        sb_puts(b, " x=\"");
+        sb_num(b, t->tx, 3);
+        sb_puts(b, "\" y=\"");
+        sb_num(b, t->ty, 3);
+        sb_putc(b, '"');
+    } else {
+        sb_puts(b, " transform=\"");
+        sb_matrix(b, t);
+        sb_putc(b, '"');
+    }
+}
+
+/* Paint ink through a stencil: a PNG whose alpha says where (its colors
+   are ignored), for a gw x gh grid placed by gm.  For masks painted with a
+   pattern, and anything masked inside an uncolored pattern (currentColor). */
+static int
+svg_put_stencil(gx_device_svg *svg, const byte *png, size_t len, int gw, int gh,
+                const gs_matrix *gm, bool pixelated, const svg_ink *ink, float opacity,
+                gs_blend_mode_t blend_mode)
+{
+    svg_buf d, *body = svg->out;
+    gs_matrix t;
+    gs_rect r;
+    gs_point c;
+    int id, mask, k;
+
+    if (ink->kind == SVG_INK_NONE)
+        return 0;
+    id = svg_image_def(svg, "image/png", png, len, gw, gh, gm, &t);
+    if (id < 0)
+        return id;
+    for (k = 0; k < 4; ++k) {
+        gs_point_transform((k & 1) ? gw : 0, (k & 2) ? gh : 0, gm, &c);
+        if (k == 0)
+            r.p = r.q = c;
+        r.p.x = min(r.p.x, c.x); r.p.y = min(r.p.y, c.y);
+        r.q.x = max(r.q.x, c.x); r.q.y = max(r.q.y, c.y);
+    }
+    sb_init(&d, svg_mem(svg));
+    sb_puts(&d, " maskUnits=\"userSpaceOnUse\" x=\"");
+    sb_num(&d, r.p.x - 1, 3);
+    sb_puts(&d, "\" y=\"");
+    sb_num(&d, r.p.y - 1, 3);
+    sb_puts(&d, "\" width=\"");
+    sb_num(&d, r.q.x - r.p.x + 2, 3);
+    sb_puts(&d, "\" height=\"");
+    sb_num(&d, r.q.y - r.p.y + 2, 3);
+    sb_printf(&d, "\" mask-type=\"alpha\"><use xlink:href=\"#i%d\"", id);
+    svg_put_placement(&d, &t);
+    if (pixelated) {
+        sb_puts(&d, " class=\"px\" image-rendering=\"optimizeSpeed\"");
+        svg->pixelated = true;
+    }
+    sb_puts(&d, "/></mask>");
+    mask = svg_put_def(svg, "mask", 'm', &d);
+    sb_free(&d);
+    if (mask < 0)
+        return mask;
+    sb_puts(body, "<rect x=\"");
+    sb_num(body, r.p.x, 3);
+    sb_puts(body, "\" y=\"");
+    sb_num(body, r.p.y, 3);
+    sb_puts(body, "\" width=\"");
+    sb_num(body, r.q.x - r.p.x, 3);
+    sb_puts(body, "\" height=\"");
+    sb_num(body, r.q.y - r.p.y, 3);
+    sb_putc(body, '"');
+    svg_put_ink(body, "fill", ink);
+    sb_printf(body, " mask=\"url(#m%d)\"", mask);
+    if (svg->Transparency) {
+        const char *blend = svg_blend_name(blend_mode);
+
+        if (opacity < 1) {
+            sb_puts(body, " opacity=\"");
+            sb_num(body, opacity < 0 ? 0 : opacity, 4);
+            sb_putc(body, '"');
+        }
+        if (blend)
+            sb_printf(body, " style=\"mix-blend-mode:%s\"", blend);
+    }
+    sb_puts(body, "/>\n");
+    return body->error;
+}
+
 /* ---------------- Clipping ---------------- */
 
 static void
@@ -1203,9 +1474,26 @@ svg_flush_canvas_painted(gx_device_svg *svg, const gs_gstate *pgs)
             }
     }
     svg_close_clip(svg);
-    code = svg_put_png_image(svg, svg->out, base, w, h, svg->width * 4, 4, alpha,
-                             x0 * svg_sx(svg), y0 * svg_sy(svg),
-                             w * svg_sx(svg), h * svg_sy(svg), pgs);
+    if (svg->pat_uncolored) {
+        /* Inside an uncolored pattern: what was painted, in currentColor. */
+        svg_buf png;
+        svg_ink ink;
+        gs_matrix gm;
+
+        ink.kind = SVG_INK_CURRENT;
+        gs_make_scaling(svg_sx(svg), svg_sy(svg), &gm);
+        gm.tx = x0 * svg_sx(svg);
+        gm.ty = y0 * svg_sy(svg);
+        sb_init(&png, svg_mem(svg));
+        code = svg_encode_png(&png, base, w, h, svg->width * 4, 4, true);
+        if (code >= 0)
+            code = svg_put_stencil(svg, (const byte *)png.data, png.len, w, h, &gm, false, &ink,
+                                   1.0, BLEND_MODE_Normal);
+        sb_free(&png);
+    } else
+        code = svg_put_png_image(svg, svg->out, base, w, h, svg->width * 4, 4, alpha,
+                                 x0 * svg_sx(svg), y0 * svg_sy(svg),
+                                 w * svg_sx(svg), h * svg_sy(svg), pgs);
     for (y = 0; y < h; ++y)
         memset(base + (size_t)y * svg->width * 4, 0, (size_t)w * 4);
     svg->cx0 = svg->cy0 = svg->cx1 = svg->cy1 = 0;
@@ -1622,6 +1910,7 @@ svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap, int rule
     gx_path gpath;
     gs_matrix cm, m, mp, page, em, inv_s;
     double size, tol;
+    svg_ink ink;
     int code;
     bool empty;
 
@@ -1679,7 +1968,7 @@ svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap, int rule
     svg_page_matrix(svg, &page);
     gs_matrix_multiply(&m, &page, &mp);         /* outline units -> page */
 
-    if (svg->TextLayer && svg->mask_depth == 0) {
+    if (svg->TextLayer && svg->mask_depth == 0 && svg->pat_depth == 0) {
         gs_font *ufont = pte->orig_font ? pte->orig_font : font;
         ushort uni[4];
         int nuni;
@@ -1721,6 +2010,7 @@ svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap, int rule
             code = 1;
         goto out;
     }
+    (void)svg_ink_of(svg, pdcolor, NULL, &ink);        /* pure: a color, or currentColor */
     if (!svg->ReuseGlyphs) {
         if (bitmap) {
             /* Draw the outline as a plain path rather than the bitmap. */
@@ -1730,11 +2020,7 @@ svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap, int rule
             sb_puts(svg->out, "<path d=\"");
             svg_put_path(svg->out, &gpath, &mp, SVG_PAGE_PREC, false);
             sb_putc(svg->out, '"');
-            if (gx_dc_pure_color(pdcolor) != 0) {
-                sb_puts(svg->out, " fill=\"");
-                sb_color(svg->out, gx_dc_pure_color(pdcolor));
-                sb_putc(svg->out, '"');
-            }
+            svg_put_ink(svg->out, "fill", &ink);
             svg_put_transparency(svg, pgs, SVG_PAINT_FILL);
             sb_puts(svg->out, "/>\n");
             code = 1;
@@ -1757,11 +2043,7 @@ svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap, int rule
     sb_printf(svg->out, "<use xlink:href=\"#g%d\" transform=\"", e->id);
     sb_matrix(svg->out, &mp);
     sb_putc(svg->out, '"');
-    if (gx_dc_pure_color(pdcolor) != 0) {
-        sb_puts(svg->out, " fill=\"");
-        sb_color(svg->out, gx_dc_pure_color(pdcolor));
-        sb_putc(svg->out, '"');
-    }
+    svg_put_ink(svg->out, "fill", &ink);
     if (rule > 0)
         sb_puts(svg->out, " fill-rule=\"evenodd\"");
     svg_put_transparency(svg, pgs, SVG_PAINT_FILL);
@@ -2175,8 +2457,335 @@ svg_text_begin(gx_device *dev, gs_gstate *pgs, const gs_text_params_t *text,
     penum->can_cache = -1;
     penum->device_disabled_grid_fitting = true;
     svg->text_enum = *ppte;
+    svg->text_depth = svg->pat_depth;
     svg->text_invisible = invisible;
     return code;
+}
+
+/* ---------------- Tiling patterns ---------------- */
+
+/*
+ * Tiling patterns (PatternType 1) are written as SVG <pattern>s instead of
+ * being rasterized: the device accumulates them itself, as pdfwrite does.
+ * Asked gxdso_pattern_can_accum, it says yes; the interpreter then runs the
+ * pattern's PaintProc between gxdso_pattern_start_accum and _finish_accum,
+ * with the CTM set to the device's initial matrix (so pattern space is
+ * default user space) and clipped to the BBox.  The device draws that into
+ * a buffer of its own, which becomes <g id="tN"> in <defs>.  Fills with the
+ * pattern then arrive with a dummy cache tile (the library asks
+ * gxdso_pattern_load whether the device has the pattern) and reference a
+ * <pattern> that tiles the content.
+ *
+ * An uncolored pattern's content is painted in currentColor, and each color
+ * it is painted in gets a <pattern> of its own that sets the color.  When
+ * the cell (BBox) is larger than the step, the <pattern> holds the
+ * neighbouring copies that reach into it.
+ */
+
+static svg_pattern *
+svg_find_pattern(gx_device_svg *svg, gx_bitmap_id id)
+{
+    int i;
+
+    for (i = svg->npatterns - 1; i >= 0; --i)   /* the latest, if accumulated twice */
+        if (svg->patterns[i].id == id)
+            return &svg->patterns[i];
+    return NULL;
+}
+
+/* Find or write the <pattern> tiling pat, for an element whose coordinates
+   map to the page by local (NULL: identity).  color: the paint color of an
+   uncolored pattern. */
+static int
+svg_pattern_def(gx_device_svg *svg, const svg_pattern *pat, const char *color,
+                const gs_matrix *local)
+{
+    svg_buf d;
+    gs_matrix pt, inv, tr, tl;
+    double bw = pat->bbox.q.x - pat->bbox.p.x, bh = pat->bbox.q.y - pat->bbox.p.y;
+    int i, j, ni, nj, id;
+
+    /* The tile is the step-sized rectangle at the cell's origin, here put
+       at (0, 0) of the pattern's own coordinates (no x, y or viewBox,
+       which renderers don't all treat alike). */
+    gs_make_translation(pat->bbox.p.x, pat->bbox.p.y, &tr);
+    gs_matrix_multiply(&tr, &pat->pm, &pt);         /* tile -> page */
+    if (local) {
+        if (gs_matrix_invert(local, &inv) < 0)
+            return_error(gs_error_undefinedresult);
+        gs_matrix_multiply(&pt, &inv, &tl);         /* tile -> local */
+        pt = tl;
+    }
+    /* Copies i, j <= 0 of the cell reach into the tile when the cell is
+       larger than the step (at most 8 in each direction). */
+    ni = bw > pat->xstep ? (int)ceil(bw / pat->xstep - 1e-6) : 1;
+    nj = bh > pat->ystep ? (int)ceil(bh / pat->ystep - 1e-6) : 1;
+    ni = min(ni, 8);
+    nj = min(nj, 8);
+    sb_init(&d, svg_mem(svg));
+    sb_puts(&d, " patternUnits=\"userSpaceOnUse\" width=\"");
+    sb_sig(&d, pat->xstep, 7);
+    sb_puts(&d, "\" height=\"");
+    sb_sig(&d, pat->ystep, 7);
+    sb_puts(&d, "\" patternTransform=\"");
+    sb_matrix(&d, &pt);
+    sb_puts(&d, "\">");
+    for (j = 0; j > -nj; --j)
+        for (i = 0; i > -ni; --i) {
+            double x = i * pat->xstep - pat->bbox.p.x, y = j * pat->ystep - pat->bbox.p.y;
+
+            sb_printf(&d, "<use xlink:href=\"#t%d\"", pat->tile);
+            if (x != 0) {
+                sb_puts(&d, " x=\"");
+                sb_sig(&d, x, 7);
+                sb_putc(&d, '"');
+            }
+            if (y != 0) {
+                sb_puts(&d, " y=\"");
+                sb_sig(&d, y, 7);
+                sb_putc(&d, '"');
+            }
+            if (color)
+                sb_printf(&d, " color=\"%s\"", color);
+            sb_puts(&d, "/>");
+        }
+    sb_puts(&d, "</pattern>");
+    id = svg_put_def(svg, "pattern", 'p', &d);
+    sb_free(&d);
+    return id;
+}
+
+/* How an element painted with pdc is written.  local maps the element's
+   coordinates to the page (NULL: identity), for patterns. */
+static int
+svg_ink_of(gx_device_svg *svg, const gx_drawing_color *pdc, const gs_matrix *local,
+           svg_ink *ink)
+{
+    const svg_pattern *pat;
+    char color[16];
+    int def;
+
+    ink->kind = SVG_INK_OTHER;
+    if (gx_dc_is_pure(pdc)) {
+        if (svg->pat_uncolored)
+            ink->kind = SVG_INK_CURRENT;
+        else {
+            ink->kind = SVG_INK_RGB;
+            ink->color = gx_dc_pure_color(pdc);
+        }
+        return 0;
+    }
+    if (pdc->type == gx_dc_type_pattern) {
+        if (pdc->colors.pattern.p_tile == NULL) {
+            ink->kind = SVG_INK_NONE;           /* the null pattern */
+            return 0;
+        }
+        if (!pdc->colors.pattern.p_tile->is_dummy)
+            return 0;                           /* rasterized by the library */
+    } else if (pdc->type != &gx_dc_pure_masked)
+        return 0;
+    pat = svg_find_pattern(svg, pdc->mask.id);
+    if (pat == NULL)
+        return 0;
+    if (pat->uncolored) {
+        if (svg->pat_uncolored)
+            strcpy(color, "currentColor");
+        else {
+            gx_color_index c = gx_dc_pure_color(pdc);
+
+            gs_snprintf(color, sizeof(color), "#%02x%02x%02x", (int)(c >> 16) & 0xff,
+                        (int)(c >> 8) & 0xff, (int)c & 0xff);
+        }
+    }
+    def = svg_pattern_def(svg, pat, pat->uncolored ? color : NULL, local);
+    if (def < 0)
+        return def;
+    ink->kind = SVG_INK_URL;
+    ink->def = def;
+    return 0;
+}
+
+/* Append ` attr="..."` (attr: "fill" or "stroke"); black fills are left
+   to the SVG default. */
+static void
+svg_put_ink(svg_buf *b, const char *attr, const svg_ink *ink)
+{
+    switch (ink->kind) {
+    case SVG_INK_RGB:
+        if (ink->color == 0 && strcmp(attr, "fill") == 0)
+            return;
+        sb_printf(b, " %s=\"", attr);
+        sb_color(b, ink->color);
+        sb_putc(b, '"');
+        break;
+    case SVG_INK_URL:
+        sb_printf(b, " %s=\"url(#p%d)\"", attr, ink->def);
+        break;
+    case SVG_INK_CURRENT:
+        sb_printf(b, " %s=\"currentColor\"", attr);
+        break;
+    default:
+        sb_printf(b, " %s=\"none\"", attr);
+        break;
+    }
+}
+
+static int
+svg_pattern_start(gx_device_svg *svg, const pattern_accum_param_s *param)
+{
+    gs_pattern1_instance_t *pinst = (gs_pattern1_instance_t *)param->pinst;
+    gs_gstate *pgs = (gs_gstate *)param->graphics_state;
+    svg_pat_accum *a;
+    gs_matrix pm, page;
+    int code;
+
+    if (pinst == NULL || svg->pat_depth >= SVG_MAX_PAT_DEPTH)
+        return_error(gs_error_limitcheck);
+    code = svg_flush_canvas(svg);               /* into the content interrupted */
+    if (code < 0)
+        return code;
+    a = &svg->pat_stack[svg->pat_depth];
+    memset(a, 0, sizeof(*a));
+    a->pat.id = pinst->id;
+    a->pat.uncolored = pinst->templat.PaintType == 2;
+    a->pat.bbox = pinst->templat.BBox;
+    a->pat.xstep = fabs(pinst->templat.XStep);
+    a->pat.ystep = fabs(pinst->templat.YStep);
+    if (a->pat.xstep == 0)
+        a->pat.xstep = max(1, a->pat.bbox.q.x - a->pat.bbox.p.x);
+    if (a->pat.ystep == 0)
+        a->pat.ystep = max(1, a->pat.bbox.q.y - a->pat.bbox.p.y);
+    /* Pattern space -> device: the CTM saved by makepattern, whose
+       translation it moved into the step matrix. */
+    pm = ctm_only(pinst->saved);
+    pm.tx += pinst->step_matrix.tx;
+    pm.ty += pinst->step_matrix.ty;
+    svg_page_matrix(svg, &page);
+    gs_matrix_multiply(&pm, &page, &a->pat.pm);
+
+    sb_init(&a->content, svg_mem(svg));
+    a->saved_out = svg->out;
+    a->saved_clip_open = svg->clip_open;
+    a->saved_clip_id = svg->clip_id;
+    a->saved_text_invisible = svg->text_invisible;
+    a->saved_painting_glyph = svg->painting_glyph;
+    a->saved_uncolored = svg->pat_uncolored;
+    a->saved_depth = svg->depth;
+    a->saved_active_mask = svg->levels[svg->depth].active_mask;
+    /* The pattern's content is painted at full opacity: the fill that uses
+       it carries the opacity and blend mode in effect (pdfi copies them
+       into the pattern's graphics state). */
+    a->pgs = pgs;
+    if (pgs) {
+        a->saved_fill_alpha = pgs->fillconstantalpha;
+        a->saved_stroke_alpha = pgs->strokeconstantalpha;
+        a->saved_blend_mode = pgs->blend_mode;
+        pgs->fillconstantalpha = pgs->strokeconstantalpha = 1.0;
+        pgs->blend_mode = BLEND_MODE_Normal;
+    }
+    svg->out = &a->content;
+    svg->clip_open = false;
+    svg->text_invisible = false;
+    svg->painting_glyph = false;
+    svg->pat_uncolored = a->pat.uncolored;
+    svg->levels[svg->depth].active_mask = 0;
+    svg->pat_depth++;
+    return 1;
+}
+
+/* Close what the pattern on top of the stack left open, and return to the
+   content it interrupted.  Returns the content's error, if any.  The
+   graphics state whose transparency was reset is restored only when the
+   pattern finishes: abandoned, it may have been freed. */
+static int
+svg_pattern_pop(gx_device_svg *svg, bool restore_gs)
+{
+    svg_pat_accum *a = &svg->pat_stack[svg->pat_depth - 1];
+    int code;
+
+    svg_layers_close(svg, 0);
+    code = svg_flush_canvas(svg);
+    svg_close_clip(svg);
+    while (svg->depth > a->saved_depth) {
+        svg_level *lv = &svg->levels[svg->depth];
+
+        if (lv->is_mask) {
+            sb_free(&lv->content);
+            svg->mask_depth--;
+        } else if (lv->wrote_g)
+            sb_puts(lv->parent_out, "</g>\n");
+        svg->out = lv->parent_out;
+        svg->depth--;
+    }
+    svg->levels[svg->depth].active_mask = a->saved_active_mask;
+    svg->out = a->saved_out;
+    svg->clip_open = a->saved_clip_open;
+    svg->clip_id = a->saved_clip_id;
+    svg->text_invisible = a->saved_text_invisible;
+    svg->painting_glyph = a->saved_painting_glyph;
+    svg->pat_uncolored = a->saved_uncolored;
+    if (a->pgs && restore_gs) {
+        a->pgs->fillconstantalpha = a->saved_fill_alpha;
+        a->pgs->strokeconstantalpha = a->saved_stroke_alpha;
+        a->pgs->blend_mode = a->saved_blend_mode;
+    }
+    svg->pat_depth--;
+    if (code >= 0 && a->content.error)
+        code = a->content.error;
+    return code;
+}
+
+static int
+svg_pattern_finish(gx_device_svg *svg)
+{
+    svg_pat_accum *a;
+    gs_matrix init, page, m, inv;
+    int code, tile;
+
+    if (svg->pat_depth == 0)
+        return 0;                               /* unbalanced: ignore */
+    a = &svg->pat_stack[svg->pat_depth - 1];
+    code = svg_pattern_pop(svg, true);
+    if (code < 0)
+        goto done;
+    /* The content was drawn with the CTM at the initial matrix and written
+       in page units: map it back to pattern space. */
+    dev_proc(svg, get_initial_matrix)((gx_device *)svg, &init);
+    svg_page_matrix(svg, &page);
+    gs_matrix_multiply(&init, &page, &m);
+    if (gs_matrix_invert(&m, &inv) < 0) {
+        code = gs_note_error(gs_error_undefinedresult);
+        goto done;
+    }
+    if (svg->npatterns == svg->patterns_cap) {
+        int cap = svg->patterns_cap ? svg->patterns_cap * 2 : 8;
+        svg_pattern *np = (svg_pattern *)gs_alloc_bytes(svg_mem(svg), cap * sizeof(svg_pattern),
+                                                        "svg patterns");
+
+        if (np == NULL) {
+            code = gs_note_error(gs_error_VMerror);
+            goto done;
+        }
+        if (svg->patterns) {
+            memcpy(np, svg->patterns, svg->npatterns * sizeof(svg_pattern));
+            gs_free_object(svg_mem(svg), svg->patterns, "svg patterns");
+        }
+        svg->patterns = np;
+        svg->patterns_cap = cap;
+    }
+    tile = ++svg->next_id;
+    sb_printf(&svg->defs, "<g id=\"t%d\" transform=\"", tile);
+    sb_matrix(&svg->defs, &inv);
+    sb_puts(&svg->defs, "\">\n");
+    if (a->content.data)
+        sb_write(&svg->defs, a->content.data, a->content.len);
+    sb_puts(&svg->defs, "</g>\n");
+    a->pat.tile = tile;
+    svg->patterns[svg->npatterns++] = a->pat;
+    code = svg->defs.error;
+done:
+    sb_free(&a->content);
+    return code < 0 ? code : 1;
 }
 
 /* ---------------- Painting ---------------- */
@@ -2188,11 +2797,12 @@ svg_fill_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
 {
     gx_device_svg *svg = (gx_device_svg *)dev;
     gs_matrix m;
+    svg_ink ink;
     int code;
 
     if (gx_path_is_void(ppath))
         return 0;
-    if (svg->text_enum && !svg->painting_glyph) {
+    if (SVG_TRACKING_GLYPHS(svg)) {
         gs_fixed_rect fb;
         gs_rect box;
 
@@ -2206,14 +2816,21 @@ svg_fill_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
     }
     if (svg->text_invisible)
         return 0;
-    if (!gx_dc_is_pure(pdcolor)) {
+    if (gx_dc_is_pattern2_color(pdcolor)) {
         if (pgs == NULL)
             return_error(gs_error_rangecheck);
-        if (gx_dc_is_pattern2_color(pdcolor)) {
-            code = svg_shading_fill(svg, pgs, ppath, params, pdcolor, pcpath);
-            if (code != 0)
-                return code < 0 ? code : 0;
-        }
+        code = svg_shading_fill(svg, pgs, ppath, params, pdcolor, pcpath);
+        if (code != 0)
+            return code < 0 ? code : 0;
+    }
+    code = svg_ink_of(svg, pdcolor, NULL, &ink);
+    if (code < 0)
+        return code;
+    if (ink.kind == SVG_INK_NONE)
+        return 0;
+    if (ink.kind == SVG_INK_OTHER) {
+        if (pgs == NULL)
+            return_error(gs_error_rangecheck);
         /* Rasterize into the canvas.  With transparency in effect, emit
            it right away so it gets this fill's opacity and blend mode. */
         code = svg_flush_canvas(svg);
@@ -2232,11 +2849,7 @@ svg_fill_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
     sb_puts(svg->out, "<path d=\"");
     svg_put_path(svg->out, ppath, &m, SVG_PAGE_PREC, false);
     sb_putc(svg->out, '"');
-    if (gx_dc_pure_color(pdcolor) != 0) {
-        sb_puts(svg->out, " fill=\"");
-        sb_color(svg->out, gx_dc_pure_color(pdcolor));
-        sb_putc(svg->out, '"');
-    }
+    svg_put_ink(svg->out, "fill", &ink);
     if (params->rule > 0)
         sb_puts(svg->out, " fill-rule=\"evenodd\"");
     svg_put_transparency(svg, pgs, SVG_PAINT_FILL);
@@ -2244,86 +2857,92 @@ svg_fill_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
     return svg->out->error;
 }
 
-static int
-svg_stroke_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
-                const gx_stroke_params *params, const gx_drawing_color *pdcolor,
-                const gx_clip_path *pcpath)
-{
-    gx_device_svg *svg = (gx_device_svg *)dev;
-    const gx_line_params *lp = &pgs->line_params;
-    gs_matrix ctm, page, m, inv, pm;
-    double k, det, width;
+/* How a stroke is laid out.  The pen is defined in user space.  If the CTM
+   is a similarity (uniform scale, rotation, reflection), the path is
+   written in page space with a scaled width; otherwise in (rescaled) user
+   space with the CTM as a transform, which SVG applies to the pen too. */
+typedef struct svg_stroke_geom_s {
+    double k;                   /* user -> page scale: sqrt |det CTM| */
     bool transform;
-    int code, i;
+    gs_matrix path_m;           /* device -> the path's written coordinates */
+    gs_matrix mk;               /* written coordinates -> page, if transform */
+} svg_stroke_geom;
 
-    if (gx_path_is_void(ppath) || svg->text_invisible)
-        return 0;
-    if (!gx_dc_is_pure(pdcolor))
-        return gx_default_stroke_path(dev, pgs, ppath, params, pdcolor, pcpath);
+/* False if the CTM is degenerate, so the stroke paints nothing. */
+static bool
+svg_stroke_geometry(const gx_device_svg *svg, const gs_gstate *pgs, svg_stroke_geom *g)
+{
+    gs_matrix ctm, page, m, inv;
+    double det, k;
 
-    /* The pen is defined in user space.  If the CTM is a similarity
-       (uniform scale, rotation, reflection), stroke in page space with a
-       scaled width; otherwise write the path in (rescaled) user space
-       with the CTM as a transform, which SVG applies to the pen too. */
     gs_currentmatrix(pgs, &ctm);
     svg_page_matrix(svg, &page);
     gs_matrix_multiply(&ctm, &page, &m);        /* user -> page */
     det = m.xx * m.yy - m.xy * m.yx;
-    k = sqrt(fabs(det));
-    transform = !(fabs(m.xx - m.yy) <= 1e-6 * k && fabs(m.xy + m.yx) <= 1e-6 * k) &&
-                !(fabs(m.xx + m.yy) <= 1e-6 * k && fabs(m.xy - m.yx) <= 1e-6 * k);
+    k = g->k = sqrt(fabs(det));
     if (k == 0)
-        return 0;
-
-    code = svg_begin_element(svg, pcpath);
-    if (code < 0)
-        return code;
-    sb_puts(svg->out, "<path d=\"");
-    if (transform) {
+        return false;
+    g->transform = !(fabs(m.xx - m.yy) <= 1e-6 * k && fabs(m.xy + m.yx) <= 1e-6 * k) &&
+                   !(fabs(m.xx + m.yy) <= 1e-6 * k && fabs(m.xy - m.yx) <= 1e-6 * k);
+    g->path_m = page;
+    if (g->transform) {
         /* Write the path in k * user space, and transform it to the page
            with mk = (m's linear part / k, m's translation). */
-        gs_matrix mk;
-
-        mk = m;
-        mk.xx /= k; mk.xy /= k; mk.yx /= k; mk.yy /= k;
-        if (gs_matrix_invert(&mk, &inv) < 0)
-            transform = false;
-        else {
-            gs_matrix_multiply(&page, &inv, &pm);       /* device -> k user */
-            svg_put_path(svg->out, ppath, &pm, SVG_PAGE_PREC, true);
-            sb_puts(svg->out, "\" transform=\"");
-            sb_matrix(svg->out, &mk);
-        }
+        g->mk = m;
+        g->mk.xx /= k; g->mk.xy /= k; g->mk.yx /= k; g->mk.yy /= k;
+        if (gs_matrix_invert(&g->mk, &inv) < 0)
+            g->transform = false;
+        else
+            gs_matrix_multiply(&page, &inv, &g->path_m);       /* device -> k user */
     }
-    if (!transform)
-        svg_put_path(svg->out, ppath, &page, SVG_PAGE_PREC, true);
-    sb_puts(svg->out, "\" fill=\"none\" stroke=\"");
-    sb_color(svg->out, gx_dc_pure_color(pdcolor));
-    sb_putc(svg->out, '"');
+    return true;
+}
 
-    width = lp->half_width * 2 * k;
+/* Append ` d="..."` for ppath laid out by g, and its transform if any. */
+static void
+svg_put_stroke_d(svg_buf *b, const gx_path *ppath, const svg_stroke_geom *g,
+                 bool gaps_as_moves)
+{
+    sb_puts(b, " d=\"");
+    svg_put_path(b, ppath, &g->path_m, SVG_PAGE_PREC, gaps_as_moves);
+    sb_putc(b, '"');
+    if (g->transform) {
+        sb_puts(b, " transform=\"");
+        sb_matrix(b, &g->mk);
+        sb_putc(b, '"');
+    }
+}
+
+/* Append the pen: width, caps, join, miter limit and dashes. */
+static void
+svg_put_pen(svg_buf *b, const gs_gstate *pgs, const svg_stroke_geom *g)
+{
+    const gx_line_params *lp = &pgs->line_params;
+    double k = g->k, width = lp->half_width * 2 * k;
+    int i;
+
     if (width <= 0)
         /* Zero width means the thinnest line the device can draw. */
-        sb_puts(svg->out, " stroke-width=\"1\" vector-effect=\"non-scaling-stroke\"");
+        sb_puts(b, " stroke-width=\"1\" vector-effect=\"non-scaling-stroke\"");
     else if (fabs(width - 1) > 1e-4) {
-        sb_puts(svg->out, " stroke-width=\"");
-        sb_num(svg->out, width, 3);
-        sb_putc(svg->out, '"');
+        sb_puts(b, " stroke-width=\"");
+        sb_num(b, width, 3);
+        sb_putc(b, '"');
     }
     switch (lp->start_cap) {
-    case gs_cap_round: sb_puts(svg->out, " stroke-linecap=\"round\""); break;
-    case gs_cap_square: sb_puts(svg->out, " stroke-linecap=\"square\""); break;
+    case gs_cap_round: sb_puts(b, " stroke-linecap=\"round\""); break;
+    case gs_cap_square: sb_puts(b, " stroke-linecap=\"square\""); break;
     default: break;
     }
     switch (lp->join) {
-    case gs_join_round: sb_puts(svg->out, " stroke-linejoin=\"round\""); break;
+    case gs_join_round: sb_puts(b, " stroke-linejoin=\"round\""); break;
     case gs_join_bevel:
-    case gs_join_none: sb_puts(svg->out, " stroke-linejoin=\"bevel\""); break;
+    case gs_join_none: sb_puts(b, " stroke-linejoin=\"bevel\""); break;
     default:
         if (fabs(lp->miter_limit - 4) > 1e-4) {
-            sb_puts(svg->out, " stroke-miterlimit=\"");
-            sb_num(svg->out, lp->miter_limit < 1 ? 1 : lp->miter_limit, 3);
-            sb_putc(svg->out, '"');
+            sb_puts(b, " stroke-miterlimit=\"");
+            sb_num(b, lp->miter_limit < 1 ? 1 : lp->miter_limit, 3);
+            sb_putc(b, '"');
         }
         break;
     }
@@ -2333,23 +2952,169 @@ svg_stroke_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
         for (i = 0; i < (int)lp->dash.pattern_size; ++i)
             sum += lp->dash.pattern[i];
         if (sum > 0) {
-            sb_puts(svg->out, " stroke-dasharray=\"");
+            sb_puts(b, " stroke-dasharray=\"");
             for (i = 0; i < (int)lp->dash.pattern_size; ++i) {
                 if (i)
-                    sb_putc(svg->out, ' ');
-                sb_num(svg->out, lp->dash.pattern[i] * k, 3);
+                    sb_putc(b, ' ');
+                sb_num(b, lp->dash.pattern[i] * k, 3);
             }
-            sb_putc(svg->out, '"');
+            sb_putc(b, '"');
             if (lp->dash.offset != 0) {
-                sb_puts(svg->out, " stroke-dashoffset=\"");
-                sb_num(svg->out, lp->dash.offset * k, 3);
-                sb_putc(svg->out, '"');
+                sb_puts(b, " stroke-dashoffset=\"");
+                sb_num(b, lp->dash.offset * k, 3);
+                sb_putc(b, '"');
             }
         }
     }
+}
+
+static int
+svg_stroke_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
+                const gx_stroke_params *params, const gx_drawing_color *pdcolor,
+                const gx_clip_path *pcpath)
+{
+    gx_device_svg *svg = (gx_device_svg *)dev;
+    svg_stroke_geom g;
+    svg_ink ink;
+    int code;
+
+    if (gx_path_is_void(ppath) || svg->text_invisible)
+        return 0;
+    if (!svg_stroke_geometry(svg, pgs, &g))
+        return 0;
+    code = svg_ink_of(svg, pdcolor, g.transform ? &g.mk : NULL, &ink);
+    if (code < 0)
+        return code;
+    if (ink.kind == SVG_INK_NONE)
+        return 0;
+    if (ink.kind == SVG_INK_OTHER)
+        return gx_default_stroke_path(dev, pgs, ppath, params, pdcolor, pcpath);
+    code = svg_begin_element(svg, pcpath);
+    if (code < 0)
+        return code;
+    sb_puts(svg->out, "<path");
+    svg_put_stroke_d(svg->out, ppath, &g, true);
+    sb_puts(svg->out, " fill=\"none\"");
+    svg_put_ink(svg->out, "stroke", &ink);
+    svg_put_pen(svg->out, pgs, &g);
     svg_put_transparency(svg, pgs, SVG_PAINT_STROKE);
     sb_puts(svg->out, "/>\n");
     return svg->out->error;
+}
+
+static bool
+svg_path_has_gaps(const gx_path *ppath)
+{
+    gs_path_enum penum;
+    gs_fixed_point pts[3];
+    int op;
+
+    gx_path_enum_init(&penum, ppath);
+    while ((op = gx_path_enum_next(&penum, pts)) != 0)
+        if (op == gs_pe_gapto)
+            return true;
+    return false;
+}
+
+/*
+ * PDF's fill-and-stroke (B, B*) under transparency is a knockout group of
+ * the two (the pdf14 compositor builds one in its fill_stroke_path): where
+ * the stroke paints, it replaces the fill rather than being composited over
+ * it.  With equal fill and stroke alpha, one SVG element whose opacity
+ * applies to both does exactly that; otherwise the fill is masked out
+ * where the stroke paints.
+ */
+static int
+svg_fill_stroke_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
+                     const gx_fill_params *fill_params, const gx_drawing_color *pdcolor_fill,
+                     const gx_stroke_params *stroke_params,
+                     const gx_drawing_color *pdcolor_stroke, const gx_clip_path *pcpath)
+{
+    gx_device_svg *svg = (gx_device_svg *)dev;
+    double ca, CA;
+    const char *blend;
+    svg_stroke_geom g;
+    svg_ink fink, sink;
+    int code;
+
+    if (pgs == NULL || !svg->Transparency || svg->text_enum || svg->text_invisible ||
+        gx_path_is_void(ppath))
+        goto separately;
+    ca = pgs->fillconstantalpha;
+    CA = pgs->strokeconstantalpha;
+    blend = svg_blend_name(pgs->blend_mode);
+    if ((ca >= 1 && CA >= 1 && !blend) || !svg_stroke_geometry(svg, pgs, &g))
+        goto separately;
+    if (ca == CA && !svg_path_has_gaps(ppath)) {
+        /* One element, in the stroke's coordinates. */
+        const gs_matrix *local = g.transform ? &g.mk : NULL;
+
+        if ((code = svg_ink_of(svg, pdcolor_fill, local, &fink)) < 0 ||
+            (code = svg_ink_of(svg, pdcolor_stroke, local, &sink)) < 0)
+            return code;
+        if (fink.kind == SVG_INK_OTHER || sink.kind == SVG_INK_OTHER)
+            goto separately;
+        code = svg_begin_element(svg, pcpath);
+        if (code < 0)
+            return code;
+        sb_puts(svg->out, "<path");
+        svg_put_stroke_d(svg->out, ppath, &g, false);
+        svg_put_ink(svg->out, "fill", &fink);
+        if (fill_params->rule > 0)
+            sb_puts(svg->out, " fill-rule=\"evenodd\"");
+        svg_put_ink(svg->out, "stroke", &sink);
+        svg_put_pen(svg->out, pgs, &g);
+        svg_put_transparency(svg, pgs, SVG_PAINT_ELEMENT);
+        sb_puts(svg->out, "/>\n");
+    } else {
+        svg_buf d;
+        gs_matrix page;
+        int mask;
+
+        /* The fill in page coordinates, the stroke in its own. */
+        if ((code = svg_ink_of(svg, pdcolor_fill, NULL, &fink)) < 0 ||
+            (code = svg_ink_of(svg, pdcolor_stroke, g.transform ? &g.mk : NULL, &sink)) < 0)
+            return code;
+        if (fink.kind == SVG_INK_OTHER || sink.kind == SVG_INK_OTHER)
+            goto separately;
+        code = svg_begin_element(svg, pcpath);
+        if (code < 0)
+            return code;
+        sb_init(&d, svg_mem(svg));
+        sb_puts(&d, " maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"");
+        sb_num(&d, svg->width * svg_sx(svg), 3);
+        sb_puts(&d, "\" height=\"");
+        sb_num(&d, svg->height * svg_sy(svg), 3);
+        sb_puts(&d, "\"><rect width=\"100%\" height=\"100%\" fill=\"#fff\"/><path");
+        svg_put_stroke_d(&d, ppath, &g, true);
+        sb_puts(&d, " fill=\"none\" stroke=\"#000\"");
+        svg_put_pen(&d, pgs, &g);
+        sb_puts(&d, "/></mask>");
+        mask = svg_put_def(svg, "mask", 'm', &d);
+        sb_free(&d);
+        if (mask < 0)
+            return mask;
+        svg_page_matrix(svg, &page);
+        sb_puts(svg->out, "<path d=\"");
+        svg_put_path(svg->out, ppath, &page, SVG_PAGE_PREC, false);
+        sb_putc(svg->out, '"');
+        svg_put_ink(svg->out, "fill", &fink);
+        if (fill_params->rule > 0)
+            sb_puts(svg->out, " fill-rule=\"evenodd\"");
+        sb_printf(svg->out, " mask=\"url(#m%d)\"", mask);
+        svg_put_transparency(svg, pgs, SVG_PAINT_FILL);
+        sb_puts(svg->out, "/>\n<path");
+        svg_put_stroke_d(svg->out, ppath, &g, true);
+        sb_puts(svg->out, " fill=\"none\"");
+        svg_put_ink(svg->out, "stroke", &sink);
+        svg_put_pen(svg->out, pgs, &g);
+        svg_put_transparency(svg, pgs, SVG_PAINT_STROKE);
+        sb_puts(svg->out, "/>\n");
+    }
+    return svg->out->error;
+separately:
+    return gx_default_fill_stroke_path(dev, pgs, ppath, fill_params, pdcolor_fill,
+                                       stroke_params, pdcolor_stroke, pcpath);
 }
 
 static int
@@ -2371,6 +3136,175 @@ svg_fill_rectangle_hl_color(gx_device *dev, const gs_fixed_rect *rect,
     }
     gx_path_free(&path, "svg_fill_rectangle_hl_color");
     return code;
+}
+
+/* ---------------- JPEG pass-through ---------------- */
+
+/*
+ * A JPEG (DCTDecode) image can be embedded as the original compressed data
+ * rather than decoded and written as a PNG, as pdfwrite does.  The DCT
+ * decode filter asks gxdso_JPEG_passthrough_query when it is created and,
+ * if told yes, sends the bytes it reads (_begin, _data, _end) while still
+ * decoding them.  Nothing identifies the stream or the image, so the bytes
+ * are collected only for an image that might use them (svg_jpeg_eligible),
+ * and used only if the image is complete and the JPEG's own header agrees
+ * with what Ghostscript drew (svg_jpeg_clean); otherwise the decoded image
+ * is written as usual.
+ */
+#define SVG_PT_IDLE 0
+#define SVG_PT_ARMED 1          /* an eligible image has begun */
+#define SVG_PT_STARTED 2        /* collecting its data */
+#define SVG_PT_ENDED 3
+#define SVG_PT_BAD 4            /* data that isn't (only) this image's */
+
+static void
+svg_jpeg_passthrough(gx_device_svg *svg, int op, const void *data, int size)
+{
+    switch (op) {
+    case gxdso_JPEG_passthrough_begin:
+        if (svg->pt_state == SVG_PT_ARMED) {
+            svg->pt_data.len = 0;
+            svg->pt_data.error = 0;
+            svg->pt_state = SVG_PT_STARTED;
+        } else if (svg->pt_state != SVG_PT_IDLE)
+            svg->pt_state = SVG_PT_BAD;
+        break;
+    case gxdso_JPEG_passthrough_data:
+        if (svg->pt_state == SVG_PT_STARTED && data && size > 0)
+            sb_write(&svg->pt_data, data, size);
+        else if (svg->pt_state == SVG_PT_ENDED)
+            svg->pt_state = SVG_PT_BAD;
+        break;
+    case gxdso_JPEG_passthrough_end:
+        if (svg->pt_state == SVG_PT_STARTED)
+            svg->pt_state = SVG_PT_ENDED;
+        break;
+    }
+}
+
+/* 1 or 3 if pcs is (the ICC equivalent of) DeviceGray or DeviceRGB, the
+   only spaces a browser shows a JPEG in as Ghostscript does; else 0. */
+static int
+svg_jpeg_components(const gs_color_space *pcs)
+{
+    gs_color_space_index i;
+
+    if (pcs == NULL)
+        return 0;
+    i = gs_color_space_get_index(pcs);
+    if (i == gs_color_space_index_ICC && pcs->cmm_icc_profile_data)
+        i = gsicc_get_default_type(pcs->cmm_icc_profile_data);
+    return i == gs_color_space_index_DeviceGray ? 1 : i == gs_color_space_index_DeviceRGB ? 3 : 0;
+}
+
+/* Could the image be shown from its compressed data, if it is a JPEG? */
+static bool
+svg_jpeg_eligible(const gs_gstate *pgs, const gs_image_common_t *pic)
+{
+    const gs_image1_t *pim = (const gs_image1_t *)pic;
+    const gx_transfer_map *t[4];
+    int n, i;
+
+    if (pic->type->index != 1 || pim->ImageMask || pim->Alpha != gs_image_alpha_none ||
+        pim->format != gs_image_format_chunky || pim->BitsPerComponent != 8)
+        return false;
+    n = svg_jpeg_components(pim->ColorSpace);
+    if (n == 0)
+        return false;
+    for (i = 0; i < n; ++i)
+        if (pim->Decode[2 * i] != 0 || pim->Decode[2 * i + 1] != 1)
+            return false;
+    t[0] = pgs->set_transfer.red; t[1] = pgs->set_transfer.green;
+    t[2] = pgs->set_transfer.blue; t[3] = pgs->set_transfer.gray;
+    for (i = 0; i < 4; ++i)
+        if (t[i] && t[i]->proc != gs_identity_transfer)
+            return false;
+    return true;
+}
+
+/* Check the collected JPEG against the image Ghostscript drew (w x h,
+   ncomp components) and copy it to out.  It must be baseline, extended or
+   progressive 8-bit (what browsers show), and a browser must apply the
+   color transform Ghostscript did: YCbCr for 3 components unless an Adobe
+   marker says otherwise, while a browser also takes JFIF, or component ids
+   'R' 'G' 'B', as a sign.  APP1 (Exif, whose orientation browsers apply)
+   and APP2 (an ICC profile, which Ghostscript ignores) are left out, and
+   an EOI is added if the data stops short of one. */
+static bool
+svg_jpeg_clean(const svg_buf *in, int w, int h, int ncomp, svg_buf *out)
+{
+    const byte *p = (const byte *)in->data, *q, *end;
+    bool jfif = false, adobe = false, sof = false;
+    int transform = 0, ids[3] = {0, 0, 0};
+    size_t i;
+
+    if (p == NULL || in->error)
+        return false;
+    for (i = 0; i + 1 < in->len && !(p[i] == 0xff && p[i + 1] == 0xd8); ++i)
+        ;
+    if (i + 1 >= in->len)
+        return false;
+    end = p + in->len;
+    p += i;
+    sb_write(out, p, 2);
+    for (q = p + 2;;) {
+        int marker, c;
+        size_t len;
+
+        if (q + 4 > end || q[0] != 0xff)
+            return false;
+        marker = q[1];
+        if (marker == 0xff) {
+            ++q;                /* fill byte */
+            continue;
+        }
+        if (marker == 0xd9 || marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7))
+            return false;       /* no frame */
+        len = ((size_t)q[2] << 8) | q[3];
+        if (len < 2 || q + 2 + len > end)
+            return false;
+        switch (marker) {
+        case 0xc0: case 0xc1: case 0xc2:
+            if (len < 8 || q[4] != 8 || ((q[5] << 8) | q[6]) != h ||
+                ((q[7] << 8) | q[8]) != w || q[9] != ncomp || len < 8 + 3 * (size_t)ncomp)
+                return false;
+            for (c = 0; c < ncomp && c < 3; ++c)
+                ids[c] = q[10 + 3 * c];
+            sof = true;
+            break;
+        case 0xc3: case 0xc5: case 0xc6: case 0xc7: case 0xc9: case 0xca:
+        case 0xcb: case 0xcd: case 0xce: case 0xcf:
+            return false;       /* lossless, hierarchical or arithmetic */
+        case 0xe0:
+            if (len >= 7 && memcmp(q + 4, "JFIF", 5) == 0)
+                jfif = true;
+            break;
+        case 0xee:
+            if (len >= 14 && memcmp(q + 4, "Adobe", 5) == 0) {
+                adobe = true;
+                transform = q[15];
+            }
+            break;
+        case 0xda:              /* start of scan: the rest is the image */
+            if (!sof)
+                return false;
+            sb_write(out, q, end - q);
+            if (end - q < 2 || end[-2] != 0xff || end[-1] != 0xd9)
+                sb_write(out, "\xff\xd9", 2);
+            if (ncomp == 3) {
+                bool gs_ycc = adobe ? transform != 0 : true;
+                bool rgb_ids = ids[0] == 'R' && ids[1] == 'G' && ids[2] == 'B';
+                bool browser_ycc = jfif ? true : adobe ? transform != 0 : !rgb_ids;
+
+                if (gs_ycc != browser_ycc)
+                    return false;
+            }
+            return out->error == 0;
+        }
+        if (marker != 0xe1 && marker != 0xe2)
+            sb_write(out, q, 2 + len);
+        q += 2 + len;
+    }
 }
 
 /* ---------------- Images ---------------- */
@@ -2398,6 +3332,10 @@ typedef struct svg_image_enum_s {
     bool pixelated;
     float opacity;              /* fill alpha when the image began */
     gs_blend_mode_t blend_mode;
+    svg_ink ink;                /* ImageMask: what it paints with */
+    int serial;                 /* > 0 if eligible for JPEG pass-through */
+    int rows;                   /* rows received */
+    int width, height, ncomp;   /* the source image */
 } svg_image_enum_t;
 
 gs_private_st_suffix_add4(st_svg_image_enum, svg_image_enum_t, "svg_image_enum_t",
@@ -2411,6 +3349,7 @@ svg_image_plane_data(gx_image_enum_common_t *info, const gx_image_plane_t *plane
     svg_image_enum_t *pie = (svg_image_enum_t *)info;
     int code = gx_image_plane_data_rows(pie->inner[0], planes, height, rows_used);
 
+    pie->rows += *rows_used;
     if (code >= 0 && pie->passes > 1) {
         int used;
         int code1 = gx_image_plane_data_rows(pie->inner[1], planes, height, &used);
@@ -2432,8 +3371,13 @@ svg_image_planes_wanted(const gx_image_enum_common_t *info, byte *wanted)
 static void
 svg_image_free(svg_image_enum_t *pie)
 {
+    gx_device_svg *svg = (gx_device_svg *)pie->dev;
     int i;
 
+    if (svg && pie->serial && svg->pt_serial == pie->serial) {
+        svg->pt_serial = 0;
+        svg->pt_state = SVG_PT_IDLE;
+    }
     for (i = 0; i < 2; ++i)
         if (pie->mdev[i]) {
             gx_device *d = (gx_device *)pie->mdev[i];
@@ -2444,6 +3388,43 @@ svg_image_free(svg_image_enum_t *pie)
             pie->mdev[i] = NULL;
         }
     gx_image_free_enum((gx_image_enum_common_t **)&pie);
+}
+
+/* Write an image placed by pie->gm (grid -> page): its data once per page,
+   as a definition, and a <use> placing it.  The definition's width and
+   height are its size on the page and the <use> carries only rotation, skew
+   and position, so renderers resample it at its final size. */
+static int
+svg_put_image(gx_device_svg *svg, const svg_image_enum_t *pie, const char *mime,
+              const byte *data, size_t len)
+{
+    svg_buf *body = svg->out;
+    gs_matrix t;
+    int id = svg_image_def(svg, mime, data, len, pie->gw, pie->gh, &pie->gm, &t);
+
+    if (id < 0)
+        return id;
+    sb_printf(body, "<use xlink:href=\"#i%d\"", id);
+    svg_put_placement(body, &t);
+    if (pie->pixelated) {
+        /* The attribute is understood by SVG renderers, the class (styled
+           in svg_write_page) by browsers; both are inherited by the image. */
+        sb_puts(body, " class=\"px\" image-rendering=\"optimizeSpeed\"");
+        svg->pixelated = true;
+    }
+    if (svg->Transparency) {
+        const char *blend = svg_blend_name(pie->blend_mode);
+
+        if (pie->opacity < 1) {
+            sb_puts(body, " opacity=\"");
+            sb_num(body, pie->opacity < 0 ? 0 : pie->opacity, 4);
+            sb_putc(body, '"');
+        }
+        if (blend)
+            sb_printf(body, " style=\"mix-blend-mode:%s\"", blend);
+    }
+    sb_puts(body, "/>\n");
+    return body->error;
 }
 
 static int
@@ -2464,6 +3445,24 @@ svg_image_end_image(gx_image_enum_common_t *info, bool draw_last)
     }
     if (code < 0 || !draw_last)
         goto done;
+    if (pie->serial && svg->pt_serial == pie->serial) {
+        /* The JPEG it was decoded from, if all of it came and it agrees. */
+        bool ok = svg->pt_state == SVG_PT_ENDED && pie->rows >= pie->height;
+        svg_buf jpeg;
+
+        svg->pt_serial = 0;
+        svg->pt_state = SVG_PT_IDLE;
+        if (ok) {
+            sb_init(&jpeg, svg_mem(svg));
+            ok = svg_jpeg_clean(&svg->pt_data, pie->width, pie->height, pie->ncomp, &jpeg);
+            if (ok)
+                code = svg_put_image(svg, pie, "image/jpeg", (const byte *)jpeg.data, jpeg.len);
+            sb_free(&jpeg);
+        }
+        svg->pt_data.len = 0;
+        if (ok)
+            goto done;
+    }
     pix = gs_alloc_bytes(svg_mem(svg), (size_t)n * (alpha ? 4 : 3), "svg image pixels");
     if (pix == NULL) {
         code = gs_note_error(gs_error_VMerror);
@@ -2496,62 +3495,18 @@ svg_image_end_image(gx_image_enum_common_t *info, bool draw_last)
     }
     {
         svg_buf png;
-        svg_buf *body = svg->out;
 
         sb_init(&png, svg_mem(svg));
         code = svg_encode_png(&png, pix, pie->gw, pie->gh, pie->gw * (alpha ? 4 : 3),
                               alpha ? 4 : 3, alpha);
-        if (code >= 0) {
-            /* Put the scaling in width/height and only rotation, skew
-               and translation in the transform, so renderers resample the
-               image at its final size. */
-            gs_matrix t = pie->gm;
-            double ax = hypot(t.xx, t.xy), ay = hypot(t.yx, t.yy);
-
-            t.xx /= ax; t.xy /= ax;
-            t.yx /= ay; t.yy /= ay;
-            sb_puts(body, "<image");
-            if (fabs(t.xx - 1) < 1e-6 && fabs(t.yy - 1) < 1e-6 &&
-                fabs(t.xy) < 1e-6 && fabs(t.yx) < 1e-6) {
-                sb_puts(body, " x=\"");
-                sb_num(body, t.tx, 3);
-                sb_puts(body, "\" y=\"");
-                sb_num(body, t.ty, 3);
-                sb_putc(body, '"');
-            } else {
-                t.tx = pie->gm.tx; t.ty = pie->gm.ty;
-                sb_puts(body, " transform=\"");
-                sb_matrix(body, &t);
-                sb_putc(body, '"');
-            }
-            sb_puts(body, " width=\"");
-            sb_num(body, pie->gw * ax, 3);
-            sb_puts(body, "\" height=\"");
-            sb_num(body, pie->gh * ay, 3);
-            sb_puts(body, "\" preserveAspectRatio=\"none\"");
-            if (pie->pixelated)
-            {
-                /* The attribute is understood by SVG renderers, the class
-                   (styled in svg_write_page) by browsers. */
-                sb_puts(body, " class=\"px\" image-rendering=\"optimizeSpeed\"");
-                svg->pixelated = true;
-            }
-            if (svg->Transparency) {
-                const char *blend = svg_blend_name(pie->blend_mode);
-
-                if (pie->opacity < 1) {
-                    sb_puts(body, " opacity=\"");
-                    sb_num(body, pie->opacity < 0 ? 0 : pie->opacity, 4);
-                    sb_putc(body, '"');
-                }
-                if (blend)
-                    sb_printf(body, " style=\"mix-blend-mode:%s\"", blend);
-            }
-            sb_puts(body, " xlink:href=\"data:image/png;base64,");
-            sb_base64(body, (const byte *)png.data, png.len);
-            sb_puts(body, "\"/>\n");
-            code = body->error;
-        }
+        if (code < 0)
+            ;
+        else if (pie->stencil && pie->ink.kind != SVG_INK_RGB)
+            code = svg_put_stencil(svg, (const byte *)png.data, png.len, pie->gw, pie->gh,
+                                   &pie->gm, pie->pixelated, &pie->ink, pie->opacity,
+                                   pie->blend_mode);
+        else
+            code = svg_put_image(svg, pie, "image/png", (const byte *)png.data, png.len);
         sb_free(&png);
     }
 done:
@@ -2609,6 +3564,7 @@ svg_begin_typed_image(gx_device *dev, const gs_gstate *pgs, const gs_matrix *pma
     gs_matrix ctm, inv, m, page, g;
     gx_drawing_color black;
     double sx, sy, fx, fy;
+    svg_ink ink;
     int type = pic->type->index, code, i, W, H;
     bool stencil = false;
 
@@ -2628,7 +3584,7 @@ svg_begin_typed_image(gx_device *dev, const gs_gstate *pgs, const gs_matrix *pma
         goto use_default;
     gs_matrix_multiply(&inv, &ctm, &m);         /* image space -> device */
 
-    if (stencil && svg->text_enum && !svg->painting_glyph) {
+    if (stencil && SVG_TRACKING_GLYPHS(svg)) {
         /* A glyph bitmap from the font rasterizer (drawn as an image mask
            when the color is a pattern): draw the outline instead. */
         gs_rect box;
@@ -2665,8 +3621,15 @@ svg_begin_typed_image(gx_device *dev, const gs_gstate *pgs, const gs_matrix *pma
         }
     }
 
-    if (stencil && !gx_dc_is_pure(pdcolor))
-        goto use_default;
+    if (stencil) {
+        /* A color is baked into the image; a pattern (or, in an uncolored
+           pattern, currentColor) is painted through it as a mask. */
+        code = svg_ink_of(svg, pdcolor, NULL, &ink);
+        if (code < 0)
+            return code;
+        if (ink.kind != SVG_INK_RGB && ink.kind != SVG_INK_URL && ink.kind != SVG_INK_CURRENT)
+            goto use_default;
+    }
 
     /* Device pixels per image sample along each image axis; keep at most
        two samples per device pixel. */
@@ -2697,20 +3660,27 @@ svg_begin_typed_image(gx_device *dev, const gs_gstate *pgs, const gs_matrix *pma
     pie->gh = (int)(H * fy + 0.5);
     pie->stencil = stencil;
     pie->passes = type == 4 ? 2 : 1;
-    if (stencil)
-        pie->mask_color = gx_dc_pure_color(pdcolor);
+    if (stencil) {
+        pie->ink = ink;
+        pie->mask_color = ink.kind == SVG_INK_RGB ? ink.color : 0;
+    }
 
     /* grid -> page = scale(1/f) x image -> device x device -> page */
     svg_page_matrix(svg, &page);
     gs_make_scaling(1 / fx, 1 / fy, &g);
     gs_matrix_multiply(&g, &m, &g);
     gs_matrix_multiply(&g, &page, &pie->gm);
-    /* Unsmoothed, visibly large samples (as the graphics library would
-       draw them): keep them crisp. */
     pie->opacity = pgs->fillconstantalpha;
     pie->blend_mode = pgs->blend_mode;
-    pie->pixelated = !pim->Interpolate && hypot(pie->gm.xx, pie->gm.xy) >= 2 &&
-        hypot(pie->gm.yx, pie->gm.yy) >= 2;
+    /* Unsmoothed, visibly large samples (as the graphics library would
+       draw them): keep them crisp.  For a one-bit mask, whose thin lines
+       smoothing would wash out, from a point per sample. */
+    {
+        double big = stencil ? 1 : 2;
+
+        pie->pixelated = !pim->Interpolate && hypot(pie->gm.xx, pie->gm.xy) >= big &&
+            hypot(pie->gm.yx, pie->gm.yy) >= big;
+    }
 
     /* user space -> grid = ImageMatrix x scale(f) */
     gs_make_scaling(fx, fy, &g);
@@ -2753,6 +3723,17 @@ svg_begin_typed_image(gx_device *dev, const gs_gstate *pgs, const gs_matrix *pma
         goto fail;
     pie->pgs = pgs;
     pie->pgs_level = pgs->level;
+    pie->width = W;
+    pie->height = H;
+    pie->ncomp = stencil ? 1 : svg_jpeg_components(pim->ColorSpace);
+    if (svg->PassThroughJPEG && svg->pt_state == SVG_PT_IDLE && !stencil &&
+        svg_jpeg_eligible(pgs, pic)) {
+        /* If its data source is a DCT filter, it is about to send us the
+           JPEG. */
+        pie->serial = ++svg->pt_next_serial;
+        svg->pt_serial = pie->serial;
+        svg->pt_state = SVG_PT_ARMED;
+    }
     pie->num_planes = pie->inner[0]->num_planes;
     memcpy(pie->plane_depths, pie->inner[0]->plane_depths, sizeof(pie->plane_depths));
     memcpy(pie->plane_widths, pie->inner[0]->plane_widths, sizeof(pie->plane_widths));
@@ -2899,6 +3880,7 @@ svg_end_group(gx_device_svg *svg)
 
     if (svg->depth == 0 || lv->is_mask)
         return 0;               /* unbalanced: ignore */
+    svg_layers_close(svg, svg->depth);
     code = svg_flush_canvas(svg);
     if (code < 0)
         return code;
@@ -2948,6 +3930,7 @@ svg_end_mask(gx_device_svg *svg)
 
     if (svg->depth == 0 || !lv->is_mask)
         return 0;               /* unbalanced: ignore */
+    svg_layers_close(svg, svg->depth);
     code = svg_flush_canvas(svg);
     if (code < 0)
         return code;
@@ -3046,11 +4029,533 @@ svg_composite(gx_device *dev, gx_device **pcdev, const gs_composite_t *pct,
     return gx_default_composite(dev, pcdev, pct, pgs, memory, cdev);
 }
 
+/* ---------------- Links, metadata and layers ---------------- */
+
+/*
+ * The interpreters pass these to devices that say they take pdfmarks (the
+ * "pdfmark" parameter) as arrays of strings: [key value ... CTM name], put
+ * as the "pdfmark" device parameter.  The device also asks pdfi for the
+ * modes made for it: WantsLinkPdfmarks (every annotation drawn as usual,
+ * links sent as pdfmarks as well, even to pages in other files) and
+ * WantsVisibleOptionalContent (hidden optional content culled as usual,
+ * visible content bracketed by OC BDC / EMC).  So:
+ *
+ *  - links (LNK, or ANN /Subtype /Link) become <a> elements over the page,
+ *    to their URI or to the file of the page they go to;
+ *  - the document information (DOCINFO) becomes <title> and <metadata>;
+ *  - optional content groups become Inkscape layers, <g> elements named
+ *    for them (by the OBJ / .PUTDICT that define them).
+ */
+
+static void
+svg_put_xchar(svg_buf *b, uint c)
+{
+    if (c == '"')
+        sb_puts(b, "&quot;");
+    else
+        svg_put_utf8(b, c);
+}
+
+/* Decode a value in PDF syntax: a literal (...) or hex <...> string, or a
+   name, to text escaped for XML (attributes included).  Text with a
+   UTF-16BE byte order mark is converted; other text is taken as Latin-1. */
+static void
+svg_mark_text(gx_device_svg *svg, svg_buf *out, const byte *s, uint n)
+{
+    byte *raw = n ? gs_alloc_bytes(svg_mem(svg), n, "svg mark text") : NULL;
+    uint i = 0, len = 0;
+
+    if (raw == NULL)
+        return;
+    if (s[0] == '(') {
+        int depth = 1;
+
+        for (i = 1; i < n && depth > 0; ++i) {
+            byte c = s[i];
+
+            if (c == '\\' && i + 1 < n) {
+                c = s[++i];
+                switch (c) {
+                case 'n': raw[len++] = '\n'; break;
+                case 'r': raw[len++] = '\r'; break;
+                case 't': raw[len++] = '\t'; break;
+                case 'b': raw[len++] = '\b'; break;
+                case 'f': raw[len++] = '\f'; break;
+                case '\r': if (i + 1 < n && s[i + 1] == '\n') ++i; break;
+                case '\n': break;
+                default:
+                    if (c >= '0' && c <= '7') {
+                        int v = c - '0', k;
+
+                        for (k = 0; k < 2 && i + 1 < n && s[i + 1] >= '0' && s[i + 1] <= '7'; ++k)
+                            v = v * 8 + (s[++i] - '0');
+                        raw[len++] = (byte)v;
+                    } else
+                        raw[len++] = c;
+                }
+                continue;
+            }
+            if (c == '(')
+                ++depth;
+            else if (c == ')' && --depth == 0)
+                break;
+            raw[len++] = c;
+        }
+    } else if (s[0] == '<' && (n < 2 || s[1] != '<')) {
+        int hi = -1;
+
+        for (i = 1; i < n && s[i] != '>'; ++i) {
+            int c = s[i], v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                    c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+
+            if (v < 0)
+                continue;
+            if (hi < 0)
+                hi = v;
+            else {
+                raw[len++] = (byte)(hi << 4 | v);
+                hi = -1;
+            }
+        }
+        if (hi >= 0)
+            raw[len++] = (byte)(hi << 4);
+    } else {
+        for (i = s[0] == '/' ? 1 : 0; i < n; ++i)
+            raw[len++] = s[i];
+    }
+    if (len >= 2 && raw[0] == 0xfe && raw[1] == 0xff) {
+        for (i = 2; i + 1 < len; i += 2) {
+            uint c = raw[i] << 8 | raw[i + 1];
+
+            if (c >= 0xd800 && c < 0xdc00 && i + 3 < len) {
+                uint d = raw[i + 2] << 8 | raw[i + 3];
+
+                if (d >= 0xdc00 && d < 0xe000) {
+                    c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
+                    i += 2;
+                }
+            }
+            svg_put_xchar(out, c);
+        }
+    } else
+        for (i = 0; i < len; ++i)
+            svg_put_xchar(out, raw[i]);
+    gs_free_object(svg_mem(svg), raw, "svg mark text");
+}
+
+/* The decoded text as a C string (NULL if empty). */
+static char *
+svg_mark_cstr(gx_device_svg *svg, const byte *s, uint n)
+{
+    svg_buf b;
+    char *r = NULL;
+
+    sb_init(&b, svg_mem(svg));
+    svg_mark_text(svg, &b, s, n);
+    if (b.len && !b.error) {
+        r = (char *)gs_alloc_bytes(svg_mem(svg), b.len + 1, "svg mark string");
+        if (r)
+            memcpy(r, b.data, b.len + 1);
+    }
+    sb_free(&b);
+    return r;
+}
+
+static bool
+svg_mark_is(const gs_param_string *p, const char *str)
+{
+    size_t n = strlen(str);
+
+    return p->size == n && memcmp(p->data, str, n) == 0;
+}
+
+/* The value of key among the pairs data[first..end), or NULL. */
+static const gs_param_string *
+svg_mark_get(const gs_param_string_array *pma, uint first, uint end, const char *key)
+{
+    uint i;
+
+    for (i = first; i + 1 < end; i += 2)
+        if (svg_mark_is(&pma->data[i], key))
+            return &pma->data[i + 1];
+    return NULL;
+}
+
+/* In dictionary text "<< ... >>", the string value of /key, if any. */
+static bool
+svg_dict_string(const byte *s, uint n, const char *key, const byte **vs, uint *vn)
+{
+    size_t kn = strlen(key);
+    uint i, j;
+
+    for (i = 0; i + kn < n; ++i) {
+        if (memcmp(s + i, key, kn) != 0 || !strchr(" \t\r\n(<", s[i + kn]))
+            continue;
+        for (j = i + kn; j < n && strchr(" \t\r\n", s[j]); ++j)
+            ;
+        if (j < n && s[j] == '(') {
+            uint k = j + 1;
+            int depth = 1;
+
+            for (; k < n; ++k) {
+                if (s[k] == '\\')
+                    ++k;
+                else if (s[k] == '(')
+                    ++depth;
+                else if (s[k] == ')' && --depth == 0)
+                    break;
+            }
+            *vs = s + j;
+            *vn = min(k + 1, n) - j;
+            return true;
+        }
+        if (j < n && s[j] == '<' && (j + 1 >= n || s[j + 1] != '<')) {
+            uint k = j;
+
+            while (k < n && s[k] != '>')
+                ++k;
+            *vs = s + j;
+            *vn = min(k + 1, n) - j;
+            return true;
+        }
+    }
+    return false;
+}
+
+static svg_mark_obj *
+svg_find_obj(gx_device_svg *svg, const byte *label, uint n)
+{
+    int i;
+
+    for (i = svg->nobjs - 1; i >= 0; --i)
+        if (strlen(svg->objs[i].label) == n && memcmp(svg->objs[i].label, label, n) == 0)
+            return &svg->objs[i];
+    return NULL;
+}
+
+static svg_mark_obj *
+svg_add_obj(gx_device_svg *svg, const byte *label, uint n)
+{
+    svg_mark_obj *o = svg_find_obj(svg, label, n);
+
+    if (o)
+        return o;
+    if (svg->nobjs == svg->objs_cap) {
+        int cap = svg->objs_cap ? svg->objs_cap * 2 : 16;
+        svg_mark_obj *no = (svg_mark_obj *)gs_alloc_bytes(svg_mem(svg), cap * sizeof(*no),
+                                                          "svg mark objs");
+
+        if (no == NULL)
+            return NULL;
+        if (svg->objs) {
+            memcpy(no, svg->objs, svg->nobjs * sizeof(*no));
+            gs_free_object(svg_mem(svg), svg->objs, "svg mark objs");
+        }
+        svg->objs = no;
+        svg->objs_cap = cap;
+    }
+    o = &svg->objs[svg->nobjs];
+    memset(o, 0, sizeof(*o));
+    o->label = (char *)gs_alloc_bytes(svg_mem(svg), n + 1, "svg mark label");
+    if (o->label == NULL)
+        return NULL;
+    memcpy(o->label, label, n);
+    o->label[n] = 0;
+    svg->nobjs++;
+    return o;
+}
+
+static void
+svg_free_str(gx_device_svg *svg, char **p)
+{
+    if (*p)
+        gs_free_object(svg_mem(svg), *p, "svg mark string");
+    *p = NULL;
+}
+
+static void
+svg_free_objs(gx_device_svg *svg)
+{
+    int i;
+
+    for (i = 0; i < svg->nobjs; ++i) {
+        svg_free_str(svg, &svg->objs[i].label);
+        svg_free_str(svg, &svg->objs[i].name);
+        svg_free_str(svg, &svg->objs[i].uri);
+        svg_free_str(svg, &svg->objs[i].ocgs);
+    }
+    if (svg->objs)
+        gs_free_object(svg_mem(svg), svg->objs, "svg mark objs");
+    svg->objs = NULL;
+    svg->nobjs = svg->objs_cap = 0;
+    for (i = 0; i < 4; ++i)
+        svg_free_str(svg, &svg->info[i]);
+}
+
+/* A link: an <a> over its rectangle, collected to go on top of the page. */
+static void
+svg_mark_link(gx_device_svg *svg, const gs_param_string_array *pma, uint end,
+              const gs_matrix *ctm)
+{
+    const gs_param_string *v;
+    const byte *us = NULL;
+    const char *ready = NULL;   /* a URI already decoded */
+    uint un = 0;
+    char tmp[256], href[512];
+    double r[4];
+    gs_rect box;
+    gs_point c;
+    int k, page = 0;
+    svg_buf *b = &svg->links;
+
+    if (!svg->Links || (v = svg_mark_get(pma, 0, end, "/Rect")) == NULL || v->size >= sizeof(tmp))
+        return;
+    memcpy(tmp, v->data, v->size);
+    tmp[v->size] = 0;
+    if (sscanf(tmp, "[%lf %lf %lf %lf]", &r[0], &r[1], &r[2], &r[3]) != 4)
+        return;
+    /* Where it goes: a URI (inline, in an action dictionary, or in one
+       defined earlier), or a page. */
+    if ((v = svg_mark_get(pma, 0, end, "/URI")) != NULL) {
+        us = v->data; un = v->size;
+    } else if ((v = svg_mark_get(pma, 0, end, "/A")) != NULL ||
+               (v = svg_mark_get(pma, 0, end, "/Action")) != NULL) {
+        if (v->size && v->data[0] == '{') {
+            svg_mark_obj *o = svg_find_obj(svg, v->data, v->size);
+
+            if (o && o->uri)
+                ready = o->uri;
+        } else if (!svg_dict_string(v->data, v->size, "/URI", &us, &un))
+            us = NULL;
+    }
+    if (us == NULL && ready == NULL && (v = svg_mark_get(pma, 0, end, "/Page")) != NULL) {
+        if (v->size < sizeof(tmp)) {
+            memcpy(tmp, v->data, v->size);
+            tmp[v->size] = 0;
+            if (strcmp(tmp, "/Next") == 0)
+                page = svg->pages_written + 2;
+            else if (strcmp(tmp, "/Prev") == 0)
+                page = svg->pages_written;
+            else
+                page = atoi(tmp);
+        }
+        if (svg->FirstPage > 1)
+            page -= svg->FirstPage - 1;  /* files are numbered from the first page output */
+        if (page <= 0)
+            return;
+    }
+    if (us == NULL && ready == NULL && page == 0)
+        return;
+    href[0] = 0;
+    if (page) {
+        gx_device_vector *vdev = (gx_device_vector *)svg;
+        const char *base = vdev->fname, *p;
+
+        if (page == svg->pages_written + 1)
+            strcpy(href, "#");
+        else if (gx_outputfile_is_separate_pages(vdev->fname, svg->memory)) {
+            for (p = vdev->fname; *p; ++p)
+                if (*p == '/' || *p == '\\' || *p == ':')
+                    base = p + 1;
+            gs_snprintf(href, sizeof(href), base, page);
+        } else
+            return;             /* that page isn't written */
+    }
+    /* The rectangle, from default user space through the CTM to the page */
+    for (k = 0; k < 4; ++k) {
+        gs_point_transform(r[(k & 1) ? 2 : 0], r[(k & 2) ? 3 : 1], ctm, &c);
+        c.x *= svg_sx(svg);
+        c.y *= svg_sy(svg);
+        if (k == 0)
+            box.p = box.q = c;
+        box.p.x = min(box.p.x, c.x); box.p.y = min(box.p.y, c.y);
+        box.q.x = max(box.q.x, c.x); box.q.y = max(box.q.y, c.y);
+    }
+    sb_puts(b, "<a xlink:href=\"");
+    if (ready)
+        sb_puts(b, ready);
+    else if (us)
+        svg_mark_text(svg, b, us, un);
+    else {
+        char *q;
+
+        for (q = href; *q; ++q)
+            svg_put_xchar(b, (byte)*q);
+    }
+    sb_puts(b, "\"><rect x=\"");
+    sb_num(b, box.p.x, 2);
+    sb_puts(b, "\" y=\"");
+    sb_num(b, box.p.y, 2);
+    sb_puts(b, "\" width=\"");
+    sb_num(b, box.q.x - box.p.x, 2);
+    sb_puts(b, "\" height=\"");
+    sb_num(b, box.q.y - box.p.y, 2);
+    sb_puts(b, "\" fill=\"#fff\" fill-opacity=\"0\"/></a>\n");
+}
+
+/* Layers: a <g> per optional content group, closed in the same context it
+   was opened in (by EMC, or by the end of the group, mask, pattern or page
+   around it, for content nested badly). */
+static void
+svg_layer_close_top(gx_device_svg *svg)
+{
+    (void)svg_flush_canvas(svg);
+    svg_close_clip(svg);
+    sb_puts(svg->out, "</g>\n");
+    svg->nlayers--;
+}
+
+static void
+svg_layers_close(gx_device_svg *svg, int min_depth)
+{
+    while (svg->nlayers > 0) {
+        const svg_layer *l = &svg->layers[svg->nlayers - 1];
+
+        if (l->out != svg->out || l->depth < min_depth || l->pat_depth != svg->pat_depth)
+            break;
+        svg_layer_close_top(svg);
+    }
+}
+
+static void
+svg_mark_bdc(gx_device_svg *svg, const gs_param_string_array *pma, uint end)
+{
+    const gs_param_string *v;
+    svg_mark_obj *o = NULL;
+    int serial = 0;
+
+    if (svg->mc_depth >= SVG_MAX_MC)
+        return;
+    if (end >= 2 && svg_mark_is(&pma->data[0], "/OC") && (v = &pma->data[1])->size &&
+        v->data[0] == '{')
+        o = svg_find_obj(svg, v->data, v->size);
+    if (o && !o->name && o->ocgs) {
+        /* An OCMD: the first of its groups */
+        const char *a = strchr(o->ocgs, '{'), *z = a ? strchr(a, '}') : NULL;
+
+        o = z ? svg_find_obj(svg, (const byte *)a, (uint)(z - a + 1)) : NULL;
+    }
+    if (o && o->name && svg->Layers && svg->nlayers < SVG_MAX_MC &&
+        svg_flush_canvas(svg) >= 0) {
+        svg_layer *l = &svg->layers[svg->nlayers++];
+
+        svg_close_clip(svg);
+        sb_printf(svg->out, "<g inkscape:groupmode=\"layer\" inkscape:label=\"");
+        sb_puts(svg->out, o->name);
+        sb_puts(svg->out, "\">\n");
+        l->serial = serial = ++svg->next_layer;
+        l->out = svg->out;
+        l->depth = svg->depth;
+        l->pat_depth = svg->pat_depth;
+        svg->page_has_layers = true;
+    }
+    svg->mc[svg->mc_depth++] = serial;
+}
+
+static void
+svg_mark_emc(gx_device_svg *svg)
+{
+    int serial;
+
+    if (svg->mc_depth == 0)
+        return;
+    serial = svg->mc[--svg->mc_depth];
+    if (serial && svg->nlayers > 0) {
+        const svg_layer *l = &svg->layers[svg->nlayers - 1];
+
+        if (l->serial == serial && l->out == svg->out && l->depth == svg->depth &&
+            l->pat_depth == svg->pat_depth)
+            svg_layer_close_top(svg);
+    }
+}
+
+static int
+svg_pdfmark(gx_device_svg *svg, const gs_param_string_array *pma)
+{
+    const gs_param_string *name;
+    char tmp[256];
+    gs_matrix ctm;
+    uint end, i;
+
+    if (pma->size < 2)
+        return 0;
+    name = &pma->data[pma->size - 1];
+    end = pma->size - 2;        /* the CTM */
+    gs_make_identity(&ctm);
+    if (pma->data[end].size < sizeof(tmp)) {
+        memcpy(tmp, pma->data[end].data, pma->data[end].size);
+        tmp[pma->data[end].size] = 0;
+        if (sscanf(tmp, "[%f %f %f %f %f %f]", &ctm.xx, &ctm.xy, &ctm.yx, &ctm.yy,
+                   &ctm.tx, &ctm.ty) != 6)
+            gs_make_identity(&ctm);
+    }
+    if (svg_mark_is(name, "LNK"))
+        svg_mark_link(svg, pma, end, &ctm);
+    else if (svg_mark_is(name, "ANN")) {
+        const gs_param_string *st = svg_mark_get(pma, 0, end, "/Subtype");
+
+        if (st && svg_mark_is(st, "/Link"))
+            svg_mark_link(svg, pma, end, &ctm);
+    } else if (svg_mark_is(name, "DOCINFO")) {
+        static const char *const keys[4] = { "/Title", "/Author", "/Subject", "/Keywords" };
+
+        for (i = 0; i < 4; ++i) {
+            const gs_param_string *v = svg_mark_get(pma, 0, end, keys[i]);
+
+            if (v) {
+                svg_free_str(svg, &svg->info[i]);
+                svg->info[i] = svg_mark_cstr(svg, v->data, v->size);
+            }
+        }
+    } else if (svg_mark_is(name, "OBJ")) {
+        const gs_param_string *v = svg_mark_get(pma, 0, end, "/_objdef");
+
+        if (v && v->size && v->data[0] == '{')
+            (void)svg_add_obj(svg, v->data, v->size);
+    } else if (svg_mark_is(name, ".PUTDICT") && end >= 1 && pma->data[0].size &&
+               pma->data[0].data[0] == '{') {
+        svg_mark_obj *o = svg_add_obj(svg, pma->data[0].data, pma->data[0].size);
+        const gs_param_string *v;
+
+        if (o == NULL)
+            return 0;
+        if ((v = svg_mark_get(pma, 1, end, "/Name")) != NULL) {
+            svg_free_str(svg, &o->name);
+            o->name = svg_mark_cstr(svg, v->data, v->size);
+        }
+        if ((v = svg_mark_get(pma, 1, end, "/URI")) != NULL) {
+            svg_free_str(svg, &o->uri);
+            o->uri = svg_mark_cstr(svg, v->data, v->size);
+        }
+        if ((v = svg_mark_get(pma, 1, end, "/OCGs")) != NULL) {
+            svg_free_str(svg, &o->ocgs);
+            o->ocgs = (char *)gs_alloc_bytes(svg_mem(svg), v->size + 1, "svg mark string");
+            if (o->ocgs) {
+                memcpy(o->ocgs, v->data, v->size);
+                o->ocgs[v->size] = 0;
+            }
+        }
+    } else if (svg_mark_is(name, "BDC") || svg_mark_is(name, "BMC"))
+        svg_mark_bdc(svg, pma, end);
+    else if (svg_mark_is(name, "EMC"))
+        svg_mark_emc(svg);
+    return 0;
+}
+
 /* ---------------- Pages ---------------- */
 
 static void
 svg_page_reset(gx_device_svg *svg)
 {
+    /* Patterns left accumulating (pdfi doesn't finish one whose PaintProc
+       failed). */
+    while (svg->pat_depth > 0) {
+        svg_pat_accum *a = &svg->pat_stack[svg->pat_depth - 1];
+
+        (void)svg_pattern_pop(svg, false);
+        sb_free(&a->content);
+    }
+    svg->npatterns = 0;
     while (svg->depth > 0) {
         if (svg->levels[svg->depth].is_mask)
             sb_free(&svg->levels[svg->depth].content);
@@ -3066,6 +4571,10 @@ svg_page_reset(gx_device_svg *svg)
     svg_map_clear(&svg->glyphs);
     svg->run.active = false;
     svg->pixelated = false;
+    svg->links.len = 0;
+    svg->links.error = 0;
+    svg->mc_depth = svg->nlayers = 0;
+    svg->page_has_layers = false;
     if (svg->canvas && svg->cx1 > svg->cx0) {
         int y;
 
@@ -3082,6 +4591,8 @@ svg_fillpage(gx_device *dev, gs_gstate *pgs, gx_device_color *pdevc)
 {
     gx_device_svg *svg = (gx_device_svg *)dev;
 
+    if (svg->pat_depth > 0)
+        return 0;               /* not the page: a pattern's content */
     /* Erasing the page discards everything drawn on it so far. */
     svg_page_reset(svg);
     if (gx_dc_is_pure(pdevc) && gx_dc_pure_color(pdevc) != 0xffffff) {
@@ -3106,7 +4617,8 @@ svg_write_page(gx_device_svg *svg)
         return code;
     svg_close_clip(svg);
     svg_flush_run(svg);
-    /* Close any groups the job left open. */
+    /* Close any groups (and layers in them) the job left open. */
+    svg_layers_close(svg, svg->depth);
     while (svg->depth > 0) {
         svg_level *lv = &svg->levels[svg->depth];
 
@@ -3117,8 +4629,10 @@ svg_write_page(gx_device_svg *svg)
             sb_puts(lv->parent_out, "</g>\n");
         svg->out = lv->parent_out;
         svg->depth--;
+        svg_layers_close(svg, svg->depth);
     }
-    if (svg->defs.error || svg->body.error || svg->text.error)
+    svg->nlayers = 0;
+    if (svg->defs.error || svg->body.error || svg->text.error || svg->links.error)
         return_error(gs_error_VMerror);
 
     if (svg->pages_written > 0 && !gx_outputfile_is_separate_pages(vdev->fname, svg->memory)) {
@@ -3134,7 +4648,10 @@ svg_write_page(gx_device_svg *svg)
     sb_init(&hdr, svg_mem(svg));
     sb_puts(&hdr, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             "<svg xmlns=\"http://www.w3.org/2000/svg\" "
-            "xmlns:xlink=\"http://www.w3.org/1999/xlink\" version=\"1.1\" width=\"");
+            "xmlns:xlink=\"http://www.w3.org/1999/xlink\" ");
+    if (svg->page_has_layers)
+        sb_puts(&hdr, "xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\" ");
+    sb_puts(&hdr, "version=\"1.1\" width=\"");
     sb_num(&hdr, w, 3);
     sb_puts(&hdr, "pt\" height=\"");
     sb_num(&hdr, h, 3);
@@ -3143,6 +4660,26 @@ svg_write_page(gx_device_svg *svg)
     sb_putc(&hdr, ' ');
     sb_num(&hdr, h, 3);
     sb_puts(&hdr, "\">\n");
+    /* The document information: a title, and Dublin Core metadata. */
+    if (svg->info[0]) {
+        sb_puts(&hdr, "<title>");
+        sb_puts(&hdr, svg->info[0]);
+        sb_puts(&hdr, "</title>\n");
+    }
+    if (svg->info[0] || svg->info[1] || svg->info[2] || svg->info[3]) {
+        static const char *const dc[4] = { "title", "creator", "description", "subject" };
+        int i;
+
+        sb_puts(&hdr, "<metadata><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" "
+                "xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><rdf:Description rdf:about=\"\">");
+        for (i = 0; i < 4; ++i)
+            if (svg->info[i]) {
+                sb_printf(&hdr, "<dc:%s>", dc[i]);
+                sb_puts(&hdr, svg->info[i]);
+                sb_printf(&hdr, "</dc:%s>", dc[i]);
+            }
+        sb_puts(&hdr, "</rdf:Description></rdf:RDF></metadata>\n");
+    }
     if (svg->pixelated)
         sb_puts(&hdr, "<style>@supports (image-rendering:pixelated){.px{image-rendering:pixelated}}</style>\n");
     if (svg->defs.len)
@@ -3170,6 +4707,8 @@ svg_write_page(gx_device_svg *svg)
         gp_fwrite(svg->text.data, 1, svg->text.len, f);
         gp_fputs("</g>\n", f);
     }
+    if (svg->links.len)
+        gp_fwrite(svg->links.data, 1, svg->links.len, f);
     gp_fputs("</svg>\n", f);
     code = gx_device_close_output_file((gx_device *)svg, vdev->fname, f);
     svg->pages_written++;
@@ -3203,6 +4742,14 @@ svg_open_device(gx_device *dev)
     svg->out = &svg->body;
     sb_init(&svg->text, mem);
     sb_init(&svg->run.xs, mem);
+    sb_init(&svg->pt_data, mem);
+    sb_init(&svg->links, mem);
+    svg->objs = NULL;
+    svg->nobjs = svg->objs_cap = 0;
+    memset(svg->info, 0, sizeof(svg->info));
+    svg->mc_depth = svg->nlayers = svg->next_layer = 0;
+    svg->pt_state = SVG_PT_IDLE;
+    svg->pt_serial = svg->pt_next_serial = 0;
     sb_init(&svg->run.chars, mem);
     svg_map_init(&svg->clips, mem);
     svg_map_init(&svg->glyphs, mem);
@@ -3212,6 +4759,10 @@ svg_open_device(gx_device *dev)
     svg->pages_written = 0;
     svg->warned_multipage = false;
     svg->depth = 0;
+    svg->pat_depth = 0;
+    svg->pat_uncolored = false;
+    svg->patterns = NULL;
+    svg->npatterns = svg->patterns_cap = 0;
     svg_page_reset(svg);
     return 0;
 }
@@ -3226,12 +4777,19 @@ svg_close_device(gx_device *dev)
     sb_free(&svg->body);
     sb_free(&svg->text);
     sb_free(&svg->run.xs);
+    sb_free(&svg->pt_data);
+    sb_free(&svg->links);
+    svg_free_objs(svg);
     sb_free(&svg->run.chars);
     svg_map_clear(&svg->clips);
     svg_map_clear(&svg->glyphs);
     if (svg->canvas)
         gs_free_object(svg_mem(svg), svg->canvas, "svg canvas");
     svg->canvas = NULL;
+    if (svg->patterns)
+        gs_free_object(svg_mem(svg), svg->patterns, "svg patterns");
+    svg->patterns = NULL;
+    svg->npatterns = svg->patterns_cap = 0;
     return 0;
 }
 
@@ -3249,6 +4807,12 @@ svg_get_params(gx_device *dev, gs_param_list *plist)
         return code;
     if ((code = param_write_bool(plist, "SVGTransparency", &svg->Transparency)) < 0)
         return code;
+    if ((code = param_write_bool(plist, "SVGPassThroughJPEG", &svg->PassThroughJPEG)) < 0)
+        return code;
+    if ((code = param_write_bool(plist, "SVGLinks", &svg->Links)) < 0)
+        return code;
+    if ((code = param_write_bool(plist, "SVGLayers", &svg->Layers)) < 0)
+        return code;
     return param_write_bool(plist, "SVGReuseGlyphs", &svg->ReuseGlyphs);
 }
 
@@ -3258,7 +4822,16 @@ svg_put_params(gx_device *dev, gs_param_list *plist)
     gx_device_svg *svg = (gx_device_svg *)dev;
     gx_device_vector *vdev = (gx_device_vector *)dev;
     bool text_layer = svg->TextLayer, reuse = svg->ReuseGlyphs, transparency = svg->Transparency;
+    bool jpeg = svg->PassThroughJPEG, links = svg->Links, layers = svg->Layers;
+    gs_param_string_array pma;
     int code, ecode = 0;
+
+    /* pdfmarks come as a parameter of their own, and nothing else with them */
+    code = param_read_string_array(plist, "pdfmark", &pma);
+    if (code == 0)
+        return svg_pdfmark(svg, &pma);
+    if (code < 0)
+        param_signal_error(plist, "pdfmark", code);
 
     if ((code = param_read_bool(plist, "SVGTextLayer", &text_layer)) < 0)
         param_signal_error(plist, "SVGTextLayer", ecode = code);
@@ -3266,6 +4839,12 @@ svg_put_params(gx_device *dev, gs_param_list *plist)
         param_signal_error(plist, "SVGReuseGlyphs", ecode = code);
     if ((code = param_read_bool(plist, "SVGTransparency", &transparency)) < 0)
         param_signal_error(plist, "SVGTransparency", ecode = code);
+    if ((code = param_read_bool(plist, "SVGPassThroughJPEG", &jpeg)) < 0)
+        param_signal_error(plist, "SVGPassThroughJPEG", ecode = code);
+    if ((code = param_read_bool(plist, "SVGLinks", &links)) < 0)
+        param_signal_error(plist, "SVGLinks", ecode = code);
+    if ((code = param_read_bool(plist, "SVGLayers", &layers)) < 0)
+        param_signal_error(plist, "SVGLayers", ecode = code);
     if (ecode < 0)
         return ecode;
     code = gdev_vector_put_params(dev, plist);
@@ -3278,6 +4857,9 @@ svg_put_params(gx_device *dev, gs_param_list *plist)
     svg->TextLayer = text_layer;
     svg->ReuseGlyphs = reuse;
     svg->Transparency = transparency;
+    svg->PassThroughJPEG = jpeg;
+    svg->Links = links;
+    svg->Layers = layers;
     return 0;
 }
 
@@ -3294,11 +4876,31 @@ svg_dev_spec_op(gx_device *dev, int op, void *data, int size)
         /* Asked with no pattern while we track text, this comes from the
            font rasterizer drawing a glyph in a shading color: say yes, so
            the glyph mask comes to fill_mask (and becomes an outline filled
-           with a gradient) instead of to a clip path accumulator.  We don't
-           accumulate real patterns. */
-        if (data == NULL && svg->text_enum && !svg->painting_glyph)
-            return 1;
+           with a gradient) instead of to a clip path accumulator. */
+        if (data == NULL)
+            return SVG_TRACKING_GLYPHS(svg) ? 1 : 0;
+        /* A tiling pattern: we write it as a <pattern> (nested too deep, the
+           library rasterizes it). */
+        return svg->pat_depth < SVG_MAX_PAT_DEPTH ? 1 : 0;
+    case gxdso_pattern_start_accum:
+        return data ? svg_pattern_start(svg, (const pattern_accum_param_s *)data) : 0;
+    case gxdso_pattern_finish_accum:
+        return svg_pattern_finish(svg);
+    case gxdso_JPEG_passthrough_query:
+        return svg->PassThroughJPEG ? 1 : 0;
+    case gxdso_JPEG_passthrough_begin:
+    case gxdso_JPEG_passthrough_data:
+    case gxdso_JPEG_passthrough_end:
+        svg_jpeg_passthrough(svg, op, data, size);
         return 0;
+    case gxdso_JPX_passthrough_query:
+        return 0;               /* only Safari shows JPEG 2000 */
+    case gxdso_pattern_exact_matrix:
+        return 1;               /* no bending of patterns to whole pixels */
+    case gxdso_pattern_load:
+        /* Do we have it on this page?  If not, the library has it drawn
+           again (we start a new file, with new defs, every page). */
+        return data && svg_find_pattern(svg, *(const gx_bitmap_id *)data) ? 1 : 0;
     case gxdso_get_dev_param:
         {
             dev_param_req_t *request = (dev_param_req_t *)data;
@@ -3309,6 +4911,22 @@ svg_dev_spec_op(gx_device *dev, int op, void *data, int size)
                 return param_write_bool(request->list, "SVGReuseGlyphs", &svg->ReuseGlyphs);
             if (strcmp(request->Param, "SVGTransparency") == 0)
                 return param_write_bool(request->list, "SVGTransparency", &svg->Transparency);
+            if (strcmp(request->Param, "SVGPassThroughJPEG") == 0)
+                return param_write_bool(request->list, "SVGPassThroughJPEG", &svg->PassThroughJPEG);
+            if (strcmp(request->Param, "SVGLinks") == 0)
+                return param_write_bool(request->list, "SVGLinks", &svg->Links);
+            if (strcmp(request->Param, "SVGLayers") == 0)
+                return param_write_bool(request->list, "SVGLayers", &svg->Layers);
+            /* We take pdfmarks, and want pdfi's modes for drawing devices
+               (see "Links, metadata and layers"). */
+            if (strcmp(request->Param, "pdfmark") == 0)
+                return param_write_null(request->list, "pdfmark");
+            if (strcmp(request->Param, "WantsLinkPdfmarks") == 0 ||
+                strcmp(request->Param, "WantsVisibleOptionalContent") == 0) {
+                bool yes = true;
+
+                return param_write_bool(request->list, request->Param, &yes);
+            }
         }
         break;
     }
