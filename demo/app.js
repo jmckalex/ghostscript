@@ -14,6 +14,8 @@ const SAMPLES = [
   ['Strokes: caps, joins, dashes', 'samples/strokes.ps'],
   ['Images', 'samples/images.ps'],
   ['Transparency (PDF)', 'samples/transparency.pdf'],
+  ['Tiling patterns', 'samples/patterns.ps'],
+  ['Links, layers, JPEG (PDF)', 'samples/features.pdf'],
   ['Text, graphics & image (PDF)', EX + 'text_graphic_image.pdf'],
   ['Annotations (PDF, 6 pages)', EX + 'annots.pdf'],
 ];
@@ -137,6 +139,16 @@ function pageView(svgText, n) {
     return wrap;
   }
   prefixIds(svg, `p${n}-`);
+  // Links to other pages' files go to those pages here; web links open
+  // in a new tab.
+  wrap.id = `page-${n}`;
+  svg.querySelectorAll('a').forEach((a) => {
+    const XLINK = 'http://www.w3.org/1999/xlink';
+    const href = a.getAttributeNS(XLINK, 'href') || '';
+    const m = href.match(/^page-(\d+)\.svg$/);
+    if (m) a.setAttributeNS(XLINK, 'xlink:href', `#page-${m[1]}`);
+    else if (/^https?:/.test(href)) a.setAttribute('target', '_blank');
+  });
   const count = (sel) => svg.querySelectorAll(sel).length;
   const w = parseFloat(svg.getAttribute('width')), h = parseFloat(svg.getAttribute('height'));
   const url = URL.createObjectURL(new Blob([svgText], { type: 'image/svg+xml' }));

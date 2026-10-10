@@ -1,0 +1,102 @@
+%!PS
+% Tiling patterns, written by the svg device as SVG <pattern>s: colored and
+% uncolored, overlapping cells, negative steps, nesting, images and image
+% masks in cells, pattern-filled text, a pattern stroked under a
+% non-uniform scale, clipping, a rotated fill, and the same patterns again
+% on page 2.
+
+/Helvetica findfont 9 scalefont setfont
+/label { gsave 0 setgray moveto show grestore } def
+
+% A colored cell: a disc and a square on cream.
+/Dots << /PatternType 1 /PaintType 1 /TilingType 1
+  /BBox [0 0 16 16] /XStep 16 /YStep 16
+  /PaintProc { pop
+    1 0.95 0.8 setrgbcolor 0 0 16 16 rectfill
+    0.8 0.2 0.2 setrgbcolor 8 8 5 0 360 arc fill
+    0.1 0.3 0.8 setrgbcolor 12 12 3 3 rectfill } >> matrix makepattern def
+
+% An uncolored cell: a cross, painted in whatever color is given.
+/Cross << /PatternType 1 /PaintType 2 /TilingType 1
+  /BBox [0 0 12 12] /XStep 12 /YStep 12
+  /PaintProc { pop 1.5 setlinewidth 2 6 moveto 10 6 lineto 6 2 moveto 6 10 lineto stroke } >>
+  matrix makepattern def
+
+% A cell larger than its step: big rings that overlap their neighbours.
+/Rings << /PatternType 1 /PaintType 1 /TilingType 1
+  /BBox [-10 -10 30 30] /XStep 20 /YStep 20
+  /PaintProc { pop 0.2 0.6 0.3 setrgbcolor 2 setlinewidth 10 10 18 0 360 arc stroke } >>
+  matrix makepattern def
+
+% Negative steps, and a rotated, scaled pattern matrix.
+/Tilted << /PatternType 1 /PaintType 1 /TilingType 2
+  /BBox [0 0 10 10] /XStep -10 /YStep -10
+  /PaintProc { pop 0.9 0.6 0.1 setrgbcolor 0 0 5 5 rectfill 0.4 0.2 0.6 setrgbcolor 5 5 5 5 rectfill } >>
+  1.4 dup matrix scale 25 matrix rotate matrix concatmatrix makepattern def
+
+% Nesting: a cell filled with another pattern, and an image and an image
+% mask in cells.
+/Nested << /PatternType 1 /PaintType 1 /TilingType 1
+  /BBox [0 0 40 40] /XStep 44 /YStep 44
+  /PaintProc { pop Dots setpattern 0 0 40 40 rectfill
+               0 setgray 1 setlinewidth 0.5 0.5 39 39 rectstroke } >>
+  matrix makepattern def
+/Pixels << /PatternType 1 /PaintType 1 /TilingType 1
+  /BBox [0 0 24 24] /XStep 24 /YStep 24
+  /PaintProc { pop gsave 24 24 scale
+    4 4 8 [4 0 0 -4 0 4] <ff0000 00ff00 0000ff ffff00 00ffff ff00ff ffffff 000000
+                          808080 ff8000 0080ff 80ff00 ff0080 8000ff 00ff80 404040>
+    false 3 colorimage grestore } >> matrix makepattern def
+/Hatch << /PatternType 1 /PaintType 2 /TilingType 1
+  /BBox [0 0 8 8] /XStep 8 /YStep 8
+  /PaintProc { pop gsave 8 8 scale 8 8 true [8 0 0 -8 0 8]
+    <80 40 20 10 08 04 02 01> imagemask grestore } >> matrix makepattern def
+
+/page {
+  /Helvetica-Bold findfont 18 scalefont setfont 40 750 moveto
+  0 setgray (Tiling patterns) show
+  /Helvetica findfont 9 scalefont setfont
+
+  (colored, rectfill) 40 715 label
+  Dots setpattern 40 590 120 120 rectfill
+
+  (uncolored, three colors) 190 715 label
+  [/Pattern /DeviceRGB] setcolorspace
+  0.8 0.1 0.1 Cross setcolor 190 590 36 120 rectfill
+  0.1 0.5 0.1 Cross setcolor 232 590 36 120 rectfill
+  0.1 0.2 0.8 Cross setcolor 274 590 36 120 rectfill
+
+  (cells larger than the step) 340 715 label
+  Rings setpattern 340 590 110 120 rectfill
+
+  (negative step, rotated) 470 715 label
+  Tilted setpattern 470 590 100 120 rectfill
+
+  (nested; image; image mask) 40 555 label
+  Nested setpattern 40 420 130 130 rectfill
+  Pixels setpattern 190 420 120 130 rectfill
+  [/Pattern /DeviceRGB] setcolorspace
+  0.6 0.1 0.6 Hatch setcolor 330 420 110 130 rectfill
+
+  (clipped to a circle) 460 555 label
+  gsave 515 485 55 0 360 arc clip Dots setpattern 455 425 120 120 rectfill grestore
+
+  (text) 40 385 label
+  /Helvetica-Bold findfont 72 scalefont setfont
+  Dots setpattern 40 310 moveto (Pattern) show
+  [/Pattern /DeviceRGB] setcolorspace 0.1 0.3 0.7 Cross setcolor
+  330 310 moveto (text) show
+  /Helvetica findfont 9 scalefont setfont
+
+  (stroked, under a non-uniform scale) 40 275 label
+  gsave 40 180 translate 3 1 scale Rings setpattern 12 setlinewidth
+  5 5 moveto 45 70 lineto 85 5 lineto stroke grestore
+
+  (filling a rotated shape: the pattern stays put) 340 275 label
+  gsave 455 195 translate 30 rotate Dots setpattern -90 -50 180 100 rectfill grestore
+} def
+
+page showpage
+page
+/Helvetica findfont 9 scalefont setfont (page 2: the same patterns again) 40 60 label
+showpage

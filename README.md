@@ -13,8 +13,14 @@ from the [Artifex release][rel] and SHA-512 verified against its
 commit shows exactly what changed: one new file, `devices/vector/gdevsvg.c`;
 its build rules (`devices/devs.mak`, and the device lists in `configure`,
 `configure.ac` and `psi/msvc.mak`); its documentation
-(`doc/src/VectorDevices.rst` and `Devices.rst`); and a two-line fix in
-`pdf/pdf.mak`. That diff is also a patch that adds the device to a
+(`doc/src/VectorDevices.rst` and `Devices.rst`); a two-line fix in
+`pdf/pdf.mak`; and small changes in the library and the PDF interpreter
+that the device asks for and other devices don't see: a device query for
+patterns' exact matrices (`gxdevsop.h`, `gsptype1.c`), a fix to the pattern
+accumulator, which wrongly reported its target's high-level colour support
+(`gxpcmap.c`; it broke `rectfill` in PostScript patterns), and two modes of
+pdfi for a drawing device that wants links and layers (`WantsLinkPdfmarks`,
+`WantsVisibleOptionalContent`; `pdf/`). That diff is also a patch that adds the device to a
 [native Ghostscript](#native-ghostscript). The rest of the port is
 `build.sh` (configure flags and Emscripten link settings) and the JS wrappers
 in `js/`.
@@ -33,6 +39,7 @@ in `js/`.
 | `test/` | tests (`npm test`) |
 | `tools/svg-compare.mjs` | pixel comparison of SVG output against Ghostscript's raster output |
 | `tools/make-transparency-pdf.mjs` | writes the transparency test PDF (`demo/samples/transparency.pdf`) |
+| `tools/make-features-pdf.mjs` | writes the features test PDF (`demo/samples/features.pdf`: patterns, JPEG, links, layers, metadata), with the JPEGs in `test/fixtures/` |
 | `tools/native-build.sh` | native builds: `release` `gs`, debug (ASan) `gs`, or `lib` for `libgs.dylib` |
 | `tools/make-patch.sh` | the svg device as a patch against the Ghostscript release |
 | `tools/check-patch.sh` | builds the release + patch natively, as a user would, and tries the device |
@@ -233,9 +240,30 @@ high-level device interface:
   alpha, including a backdrop color (`/BC`), and a transfer function
   (`/TR`) becomes a filter on the mask. Images with an SMask are drawn
   through a mask too. Knockout groups are drawn as ordinary groups.
+- **Tiling patterns become `<pattern>`s.** The device accumulates each
+  pattern itself, as pdfwrite does: the PaintProc's content becomes a
+  `<g>`, tiled by a `<pattern>` with the pattern's exact matrix (the library
+  normally bends patterns to whole device pixels; the device asks it not
+  to). Uncolored patterns are drawn in `currentColor`, one `<pattern>` per
+  colour; cells larger than their step get their overlapping neighbours.
+  Fills, strokes, text and image masks can all be painted with them.
+- **JPEGs pass through; images are written once.** A JPEG in DeviceGray or
+  DeviceRGB is embedded as its original data (the DCT filter hands it to the
+  device while decoding), when its header shows a browser will show it as
+  Ghostscript does. An image drawn twice on a page is one definition used
+  twice.
+- **Fill-and-stroke knocks out.** PDF's `B` under transparency is one
+  element (or a fill masked by the stroke), not a stroke composited over a
+  fill.
+- **Links, metadata and layers.** PDF Link annotations and PostScript
+  `/ANN` / `/LNK` pdfmarks become `<a>` elements (a link to another page goes
+  to its file); the document information becomes `<title>` and Dublin Core
+  `<metadata>`; visible optional content groups become Inkscape layers.
+  They arrive as pdfmarks, in pdfi modes made for drawing devices: every
+  annotation is still drawn, and hidden layers still culled.
 - **Anything SVG can't express is still drawn exactly.** That covers mesh and
   function-based shadings, radial shadings whose circles aren't nested
-  (cones), tiling patterns, ImageType 3 masks, and raster operations.
+  (cones), ImageType 3 masks, and raster operations.
   The graphics library rasterizes it into an RGBA canvas at the device
   resolution, and that canvas is embedded as a PNG at the right point in the
   painting order. The default resolution is 192 dpi, and `-r` changes it. Vector
@@ -254,6 +282,9 @@ output" section of `src/ghostscript-10.08.0/doc/src/VectorDevices.rst`.
 | `-dSVGTextLayer=false` | true | omit the invisible text layer |
 | `-dSVGReuseGlyphs=false` | true | write each glyph as a plain path instead of `<use>` |
 | `-dSVGTransparency=false` | true | let Ghostscript's compositor flatten transparency to images |
+| `-dSVGPassThroughJPEG=false` | true | decode JPEGs and write them as PNG |
+| `-dSVGLinks=false` | true | no `<a>` elements |
+| `-dSVGLayers=false` | true | no layers for optional content groups |
 | `-r<dpi>` | 192 | resolution of rasterized fallback content |
 
 **Fidelity** is checked by `tools/svg-compare.mjs`. It renders each file
