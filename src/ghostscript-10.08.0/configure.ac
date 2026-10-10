@@ -1626,6 +1626,12 @@ else
   if test -z "$PNGDEVS"; then
     AC_MSG_NOTICE([disabling png output devices])
   fi
+  dnl the svg device embeds images as PNG, so it needs libpng too
+  if test -n "$PNGDEVS"; then
+    SVGDEVS='svg'
+  else
+    SVGDEVS=''
+  fi
 fi
 AC_SUBST(SHARE_LIBPNG)
 AC_SUBST(LIBPNGDIR)
@@ -2830,6 +2836,7 @@ AC_ARG_WITH(drivers,
                           PCX      = Output to PCX
                           PNG      = Output to PNG
                           PS       = Output to PostScript/PDF
+                          SVG      = Output to SVG
                           TIFF     = Output to TIFF
                           URF      = Output to URF
                           You can mix both variants, e.g.
@@ -2963,7 +2970,7 @@ while test -n "$drivers"; do
                 fi
                 ;;
         FILES)
-                F_DEVS0="$F_DEVS0 $BMP_DEVS $FAX_DEVS $JPEG_DEVS $TIFFDEVS $PCX_DEVS $PBM_DEVS $PS_DEVS $MISC_FDEVS $XPSDEV $URF_DEVS"
+                F_DEVS0="$F_DEVS0 $BMP_DEVS $FAX_DEVS $JPEG_DEVS $TIFFDEVS $PCX_DEVS $PBM_DEVS $PS_DEVS $MISC_FDEVS $XPSDEV $URF_DEVS $SVGDEVS"
                 CUPS_DEVS0="$CUPSDEV"
                 JBIG2_DEVS="$JBIG2FILEDEVS"
                 PNG_DEVS0="$PNGDEVS"
@@ -3047,6 +3054,10 @@ while test -n "$drivers"; do
         PS)
                 # PostScript/PDF writing
                 F_DEVS0="$F_DEVS0 $PS_DEVS"
+                ;;
+        SVG)
+                # SVG writing
+                F_DEVS0="$F_DEVS0 $SVGDEVS"
                 ;;
         XPS)
                 # XPS writing

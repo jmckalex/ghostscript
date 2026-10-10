@@ -1758,6 +1758,7 @@ Optional Packages:
                           PCX      = Output to PCX
                           PNG      = Output to PNG
                           PS       = Output to PostScript/PDF
+                          SVG      = Output to SVG
                           TIFF     = Output to TIFF
                           URF      = Output to URF
                           You can mix both variants, e.g.
@@ -10058,6 +10059,11 @@ fi
     { printf "%s\n" "$as_me:${as_lineno-$LINENO}: disabling png output devices" >&5
 printf "%s\n" "$as_me: disabling png output devices" >&6;}
   fi
+    if test -n "$PNGDEVS"; then
+    SVGDEVS='svg'
+  else
+    SVGDEVS=''
+  fi
 fi
 
 
@@ -13260,7 +13266,7 @@ printf "%s\n" "$as_me: WARNING: Unable to include opvp/oprp driver due to missin
                 fi
                 ;;
         FILES)
-                F_DEVS0="$F_DEVS0 $BMP_DEVS $FAX_DEVS $JPEG_DEVS $TIFFDEVS $PCX_DEVS $PBM_DEVS $PS_DEVS $MISC_FDEVS $XPSDEV $URF_DEVS"
+                F_DEVS0="$F_DEVS0 $BMP_DEVS $FAX_DEVS $JPEG_DEVS $TIFFDEVS $PCX_DEVS $PBM_DEVS $PS_DEVS $MISC_FDEVS $XPSDEV $URF_DEVS $SVGDEVS"
                 CUPS_DEVS0="$CUPSDEV"
                 JBIG2_DEVS="$JBIG2FILEDEVS"
                 PNG_DEVS0="$PNGDEVS"
@@ -13344,6 +13350,10 @@ printf "%s\n" "$as_me: WARNING: Unable to include opvp/oprp driver due to missin
         PS)
                 # PostScript/PDF writing
                 F_DEVS0="$F_DEVS0 $PS_DEVS"
+                ;;
+        SVG)
+                # SVG writing
+                F_DEVS0="$F_DEVS0 $SVGDEVS"
                 ;;
         XPS)
                 # XPS writing

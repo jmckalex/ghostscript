@@ -710,6 +710,11 @@ Text output
 
 The :title:`txtwrite` device will output the text contained in the original document as Unicode.
 
+SVG writer
+~~~~~~~~~~~~~~~~~~~~
+
+The :title:`svg` device outputs each page as a standalone SVG file, with vector paths, selectable text, gradients and transparency. See :ref:`SVG output<VectorDevices_SVG>`.
+
 
 .. _Devices_Display_Device:
 .. _Devices_Display_Devices:

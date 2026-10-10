@@ -31,6 +31,9 @@
    Device parameters:
      -dSVGTextLayer=false     omit the invisible text layer
      -dSVGReuseGlyphs=false   write every glyph as a plain path
+     -dSVGTransparency=false  let the pdf14 compositor flatten transparency
+
+   User documentation: doc/src/VectorDevices.rst, "SVG output".
 */
 
 #include "math_.h"

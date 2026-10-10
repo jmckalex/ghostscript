@@ -6,7 +6,7 @@
 #   ./build.sh reconfigure   force a fresh configure, then build
 #
 # Variants (VARIANT=...):
-#   full (default)  all file-format output devices + svg; built in the source
+#   full (default)  all file-format output devices, svg included; built in the source
 #                   tree; output in dist/
 #   lean            just the PostScript and PDF interpreters (no output
 #                   devices beyond bbox and the null device, and no CJK
@@ -32,7 +32,7 @@ case "$VARIANT" in
     BUILD="$SRC"
     DIST="$ROOT/dist"
     VARIANT_FLAGS=(
-      --with-drivers=FILES,svg  # file-format devices (pdf/ps/png/jpeg/tiff/...) + SVG
+      --with-drivers=FILES      # file-format devices: pdf/ps/png/jpeg/tiff/svg/...
     )
     MAKE_VARS=()
     ;;
