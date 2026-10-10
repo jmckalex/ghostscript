@@ -66,6 +66,8 @@
 #include "gsshade.h"
 #include "gsfunc.h"
 #include "gxshade.h"
+#include "gstrans.h"
+#include "gxcomp.h"
 #include "png_.h"
 #include "doc_common.h"
 
@@ -402,6 +404,20 @@ typedef struct svg_text_run_s {
     svg_buf chars;              /* escaped UTF-8 text */
 } svg_text_run;
 
+/* A transparency group or soft mask level.  Level 0 is the page. */
+#define SVG_MAX_LEVELS 64
+typedef struct svg_level_s {
+    svg_buf *parent_out;        /* output to restore when this level ends */
+    bool is_mask;
+    bool wrote_g;               /* a group that needed a <g> */
+    bool alpha_mask;            /* mask: alpha rather than luminosity */
+    double backdrop;            /* mask: luminosity of the backdrop */
+    bool has_tr;                /* mask: transfer function (TR) */
+    byte tr[256];               /* mask: TR sampled at 0, 1/255, ..., 1 */
+    svg_buf content;            /* mask: its content */
+    int active_mask;            /* mask for the next group begun here */
+} svg_level;
+
 typedef struct gx_device_svg_s {
     gx_device_vector_common;
     /* Parameters */
@@ -425,6 +441,12 @@ typedef struct gx_device_svg_s {
     bool painting_glyph;        /* filling a glyph outline ourselves */
     bool pixelated;             /* page has unsmoothed (class "px") images */
     svg_text_run run;
+    /* Transparency: nested groups and soft masks being written */
+    bool Transparency;
+    svg_buf *out;               /* where painting goes: body or a mask */
+    svg_level levels[SVG_MAX_LEVELS];
+    int depth;
+    int mask_depth;             /* > 0 while constructing a soft mask */
     /* Raster fallback canvas (RGBA, device resolution) */
     byte *canvas;
     int cx0, cy0, cx1, cy1;     /* dirty box, exclusive max; empty if cx0 >= cx1 */
@@ -452,6 +474,11 @@ static dev_proc_copy_color(svg_copy_color);
 static dev_proc_copy_alpha(svg_copy_alpha);
 static dev_proc_fill_mask(svg_fill_mask);
 static dev_proc_fill_path(svg_fill_path);
+#define SVG_PAINT_FILL 0
+#define SVG_PAINT_STROKE 1
+#define SVG_PAINT_ELEMENT 2
+static void svg_put_transparency(gx_device_svg *svg, const gs_gstate *pgs, int what);
+static const char *svg_blend_name(gs_blend_mode_t bm);
 static int svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap,
                           int rule, const gx_drawing_color *pdcolor,
                           const gx_clip_path *pcpath);
@@ -462,6 +489,7 @@ static dev_proc_text_begin(svg_text_begin);
 static dev_proc_fillpage(svg_fillpage);
 static dev_proc_dev_spec_op(svg_dev_spec_op);
 static dev_proc_begin_typed_image(svg_begin_typed_image);
+static dev_proc_composite(svg_composite);
 
 const gx_device_svg gs_svg_device = {
     svg_device_body("svg", svg_initialize_device_procs),
@@ -474,6 +502,7 @@ svg_initialize_device(gx_device *dev)
 
     svg->TextLayer = true;
     svg->ReuseGlyphs = true;
+    svg->Transparency = true;
     return 0;
 }
 
@@ -503,6 +532,7 @@ svg_initialize_device_procs(gx_device *dev)
     set_dev_proc(dev, fillpage, svg_fillpage);
     set_dev_proc(dev, dev_spec_op, svg_dev_spec_op);
     set_dev_proc(dev, begin_typed_image, svg_begin_typed_image);
+    set_dev_proc(dev, composite, svg_composite);
 }
 
 /* The vector procedures are required by the vector device superclass but
@@ -1010,7 +1040,7 @@ sb_base64(svg_buf *b, const byte *p, size_t n)
 static int
 svg_put_png_image(gx_device_svg *svg, svg_buf *b, const byte *pix, int w, int h,
                   int stride, int bpp, bool alpha, double x, double y,
-                  double width, double height)
+                  double width, double height, const gs_gstate *pgs)
 {
     svg_buf png;
     int code;
@@ -1026,7 +1056,10 @@ svg_put_png_image(gx_device_svg *svg, svg_buf *b, const byte *pix, int w, int h,
         sb_num(b, width, 3);
         sb_puts(b, "\" height=\"");
         sb_num(b, height, 3);
-        sb_puts(b, "\" preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,");
+        sb_puts(b, "\" preserveAspectRatio=\"none\"");
+        if (pgs)
+            svg_put_transparency(svg, pgs, SVG_PAINT_ELEMENT);
+        sb_puts(b, " xlink:href=\"data:image/png;base64,");
         sb_base64(b, (const byte *)png.data, png.len);
         sb_puts(b, "\"/>\n");
     }
@@ -1040,7 +1073,7 @@ static void
 svg_close_clip(gx_device_svg *svg)
 {
     if (svg->clip_open) {
-        sb_puts(&svg->body, "</g>\n");
+        sb_puts(svg->out, "</g>\n");
         svg->clip_open = false;
     }
 }
@@ -1138,7 +1171,7 @@ svg_set_clip(gx_device_svg *svg, const gx_clip_path *pcpath)
     }
     if (id < 0)
         return id;
-    sb_printf(&svg->body, "<g clip-path=\"url(#c%d)\">\n", id);
+    sb_printf(svg->out, "<g clip-path=\"url(#c%d)\">\n", id);
     svg->clip_open = true;
     svg->clip_id = pcpath->id;
     return 0;
@@ -1147,7 +1180,7 @@ svg_set_clip(gx_device_svg *svg, const gx_clip_path *pcpath)
 /* Emit any pending raster fallback content (unclipped: it was clipped
    when it was rendered). */
 static int
-svg_flush_canvas(gx_device_svg *svg)
+svg_flush_canvas_painted(gx_device_svg *svg, const gs_gstate *pgs)
 {
     int x0 = svg->cx0, y0 = svg->cy0, w = svg->cx1 - svg->cx0, h = svg->cy1 - svg->cy0;
     int x, y, code;
@@ -1167,13 +1200,19 @@ svg_flush_canvas(gx_device_svg *svg)
             }
     }
     svg_close_clip(svg);
-    code = svg_put_png_image(svg, &svg->body, base, w, h, svg->width * 4, 4, alpha,
+    code = svg_put_png_image(svg, svg->out, base, w, h, svg->width * 4, 4, alpha,
                              x0 * svg_sx(svg), y0 * svg_sy(svg),
-                             w * svg_sx(svg), h * svg_sy(svg));
+                             w * svg_sx(svg), h * svg_sy(svg), pgs);
     for (y = 0; y < h; ++y)
         memset(base + (size_t)y * svg->width * 4, 0, (size_t)w * 4);
     svg->cx0 = svg->cy0 = svg->cx1 = svg->cy1 = 0;
     return code;
+}
+
+static int
+svg_flush_canvas(gx_device_svg *svg)
+{
+    return svg_flush_canvas_painted(svg, NULL);
 }
 
 /* Prepare to append a painted element to the body. */
@@ -1637,7 +1676,7 @@ svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap, int rule
     svg_page_matrix(svg, &page);
     gs_matrix_multiply(&m, &page, &mp);         /* outline units -> page */
 
-    if (svg->TextLayer) {
+    if (svg->TextLayer && svg->mask_depth == 0) {
         gs_font *ufont = pte->orig_font ? pte->orig_font : font;
         ushort uni[4];
         int nuni;
@@ -1685,15 +1724,16 @@ svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap, int rule
             code = svg_begin_element(svg, pcpath);
             if (code < 0)
                 goto out;
-            sb_puts(&svg->body, "<path d=\"");
-            svg_put_path(&svg->body, &gpath, &mp, SVG_PAGE_PREC, false);
-            sb_putc(&svg->body, '"');
+            sb_puts(svg->out, "<path d=\"");
+            svg_put_path(svg->out, &gpath, &mp, SVG_PAGE_PREC, false);
+            sb_putc(svg->out, '"');
             if (gx_dc_pure_color(pdcolor) != 0) {
-                sb_puts(&svg->body, " fill=\"");
-                sb_color(&svg->body, gx_dc_pure_color(pdcolor));
-                sb_putc(&svg->body, '"');
+                sb_puts(svg->out, " fill=\"");
+                sb_color(svg->out, gx_dc_pure_color(pdcolor));
+                sb_putc(svg->out, '"');
             }
-            sb_puts(&svg->body, "/>\n");
+            svg_put_transparency(svg, pgs, SVG_PAINT_FILL);
+            sb_puts(svg->out, "/>\n");
             code = 1;
         } else
             code = 0;           /* paint what we were given */
@@ -1711,17 +1751,18 @@ svg_glyph_draw(gx_device_svg *svg, const gs_rect *dev_box, bool bitmap, int rule
     code = svg_begin_element(svg, pcpath);
     if (code < 0)
         goto out;
-    sb_printf(&svg->body, "<use xlink:href=\"#g%d\" transform=\"", e->id);
-    sb_matrix(&svg->body, &mp);
-    sb_putc(&svg->body, '"');
+    sb_printf(svg->out, "<use xlink:href=\"#g%d\" transform=\"", e->id);
+    sb_matrix(svg->out, &mp);
+    sb_putc(svg->out, '"');
     if (gx_dc_pure_color(pdcolor) != 0) {
-        sb_puts(&svg->body, " fill=\"");
-        sb_color(&svg->body, gx_dc_pure_color(pdcolor));
-        sb_putc(&svg->body, '"');
+        sb_puts(svg->out, " fill=\"");
+        sb_color(svg->out, gx_dc_pure_color(pdcolor));
+        sb_putc(svg->out, '"');
     }
     if (rule > 0)
-        sb_puts(&svg->body, " fill-rule=\"evenodd\"");
-    sb_puts(&svg->body, "/>\n");
+        sb_puts(svg->out, " fill-rule=\"evenodd\"");
+    svg_put_transparency(svg, pgs, SVG_PAINT_FILL);
+    sb_puts(svg->out, "/>\n");
     code = 1;
     goto out;
 raw:
@@ -2048,22 +2089,23 @@ svg_shading_fill(gx_device_svg *svg, const gs_gstate *pgs, gx_path *ppath,
     if (code < 0)
         return code;
     for (i = 0; i < nclips; ++i)
-        sb_printf(&svg->body, "<g clip-path=\"url(#c%d)\">", clips[i]);
+        sb_printf(svg->out, "<g clip-path=\"url(#c%d)\">", clips[i]);
     {
         gs_matrix m;
 
         svg_page_matrix(svg, &m);
-        sb_puts(&svg->body, "<path d=\"");
-        svg_put_path(&svg->body, ppath, &m, SVG_PAGE_PREC, false);
-        sb_printf(&svg->body, "\" fill=\"url(#s%d)\"", gid);
+        sb_puts(svg->out, "<path d=\"");
+        svg_put_path(svg->out, ppath, &m, SVG_PAGE_PREC, false);
+        sb_printf(svg->out, "\" fill=\"url(#s%d)\"", gid);
         if (params->rule > 0)
-            sb_puts(&svg->body, " fill-rule=\"evenodd\"");
-        sb_puts(&svg->body, "/>");
+            sb_puts(svg->out, " fill-rule=\"evenodd\"");
+        svg_put_transparency(svg, pgs, SVG_PAINT_FILL);
+        sb_puts(svg->out, "/>");
     }
     for (i = 0; i < nclips; ++i)
-        sb_puts(&svg->body, "</g>");
-    sb_putc(&svg->body, '\n');
-    return svg->body.error ? svg->body.error : 1;
+        sb_puts(svg->out, "</g>");
+    sb_putc(svg->out, '\n');
+    return svg->out->error ? svg->out->error : 1;
 none:
     sb_free(&d);
     sb_free(&g);
@@ -2169,25 +2211,34 @@ svg_fill_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
             if (code != 0)
                 return code < 0 ? code : 0;
         }
-        /* Rasterize into the canvas. */
-        return gx_default_fill_path(dev, pgs, ppath, params, pdcolor, pcpath);
+        /* Rasterize into the canvas.  With transparency in effect, emit
+           it right away so it gets this fill's opacity and blend mode. */
+        code = svg_flush_canvas(svg);
+        if (code < 0)
+            return code;
+        code = gx_default_fill_path(dev, pgs, ppath, params, pdcolor, pcpath);
+        if (code >= 0 && svg->Transparency &&
+            (pgs->fillconstantalpha < 1 || svg_blend_name(pgs->blend_mode)))
+            code = svg_flush_canvas_painted(svg, pgs);
+        return code;
     }
     code = svg_begin_element(svg, pcpath);
     if (code < 0)
         return code;
     svg_page_matrix(svg, &m);
-    sb_puts(&svg->body, "<path d=\"");
-    svg_put_path(&svg->body, ppath, &m, SVG_PAGE_PREC, false);
-    sb_putc(&svg->body, '"');
+    sb_puts(svg->out, "<path d=\"");
+    svg_put_path(svg->out, ppath, &m, SVG_PAGE_PREC, false);
+    sb_putc(svg->out, '"');
     if (gx_dc_pure_color(pdcolor) != 0) {
-        sb_puts(&svg->body, " fill=\"");
-        sb_color(&svg->body, gx_dc_pure_color(pdcolor));
-        sb_putc(&svg->body, '"');
+        sb_puts(svg->out, " fill=\"");
+        sb_color(svg->out, gx_dc_pure_color(pdcolor));
+        sb_putc(svg->out, '"');
     }
     if (params->rule > 0)
-        sb_puts(&svg->body, " fill-rule=\"evenodd\"");
-    sb_puts(&svg->body, "/>\n");
-    return svg->body.error;
+        sb_puts(svg->out, " fill-rule=\"evenodd\"");
+    svg_put_transparency(svg, pgs, SVG_PAINT_FILL);
+    sb_puts(svg->out, "/>\n");
+    return svg->out->error;
 }
 
 static int
@@ -2224,7 +2275,7 @@ svg_stroke_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
     code = svg_begin_element(svg, pcpath);
     if (code < 0)
         return code;
-    sb_puts(&svg->body, "<path d=\"");
+    sb_puts(svg->out, "<path d=\"");
     if (transform) {
         /* Write the path in k * user space, and transform it to the page
            with mk = (m's linear part / k, m's translation). */
@@ -2236,40 +2287,40 @@ svg_stroke_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
             transform = false;
         else {
             gs_matrix_multiply(&page, &inv, &pm);       /* device -> k user */
-            svg_put_path(&svg->body, ppath, &pm, SVG_PAGE_PREC, true);
-            sb_puts(&svg->body, "\" transform=\"");
-            sb_matrix(&svg->body, &mk);
+            svg_put_path(svg->out, ppath, &pm, SVG_PAGE_PREC, true);
+            sb_puts(svg->out, "\" transform=\"");
+            sb_matrix(svg->out, &mk);
         }
     }
     if (!transform)
-        svg_put_path(&svg->body, ppath, &page, SVG_PAGE_PREC, true);
-    sb_puts(&svg->body, "\" fill=\"none\" stroke=\"");
-    sb_color(&svg->body, gx_dc_pure_color(pdcolor));
-    sb_putc(&svg->body, '"');
+        svg_put_path(svg->out, ppath, &page, SVG_PAGE_PREC, true);
+    sb_puts(svg->out, "\" fill=\"none\" stroke=\"");
+    sb_color(svg->out, gx_dc_pure_color(pdcolor));
+    sb_putc(svg->out, '"');
 
     width = lp->half_width * 2 * k;
     if (width <= 0)
         /* Zero width means the thinnest line the device can draw. */
-        sb_puts(&svg->body, " stroke-width=\"1\" vector-effect=\"non-scaling-stroke\"");
+        sb_puts(svg->out, " stroke-width=\"1\" vector-effect=\"non-scaling-stroke\"");
     else if (fabs(width - 1) > 1e-4) {
-        sb_puts(&svg->body, " stroke-width=\"");
-        sb_num(&svg->body, width, 3);
-        sb_putc(&svg->body, '"');
+        sb_puts(svg->out, " stroke-width=\"");
+        sb_num(svg->out, width, 3);
+        sb_putc(svg->out, '"');
     }
     switch (lp->start_cap) {
-    case gs_cap_round: sb_puts(&svg->body, " stroke-linecap=\"round\""); break;
-    case gs_cap_square: sb_puts(&svg->body, " stroke-linecap=\"square\""); break;
+    case gs_cap_round: sb_puts(svg->out, " stroke-linecap=\"round\""); break;
+    case gs_cap_square: sb_puts(svg->out, " stroke-linecap=\"square\""); break;
     default: break;
     }
     switch (lp->join) {
-    case gs_join_round: sb_puts(&svg->body, " stroke-linejoin=\"round\""); break;
+    case gs_join_round: sb_puts(svg->out, " stroke-linejoin=\"round\""); break;
     case gs_join_bevel:
-    case gs_join_none: sb_puts(&svg->body, " stroke-linejoin=\"bevel\""); break;
+    case gs_join_none: sb_puts(svg->out, " stroke-linejoin=\"bevel\""); break;
     default:
         if (fabs(lp->miter_limit - 4) > 1e-4) {
-            sb_puts(&svg->body, " stroke-miterlimit=\"");
-            sb_num(&svg->body, lp->miter_limit < 1 ? 1 : lp->miter_limit, 3);
-            sb_putc(&svg->body, '"');
+            sb_puts(svg->out, " stroke-miterlimit=\"");
+            sb_num(svg->out, lp->miter_limit < 1 ? 1 : lp->miter_limit, 3);
+            sb_putc(svg->out, '"');
         }
         break;
     }
@@ -2279,22 +2330,23 @@ svg_stroke_path(gx_device *dev, const gs_gstate *pgs, gx_path *ppath,
         for (i = 0; i < (int)lp->dash.pattern_size; ++i)
             sum += lp->dash.pattern[i];
         if (sum > 0) {
-            sb_puts(&svg->body, " stroke-dasharray=\"");
+            sb_puts(svg->out, " stroke-dasharray=\"");
             for (i = 0; i < (int)lp->dash.pattern_size; ++i) {
                 if (i)
-                    sb_putc(&svg->body, ' ');
-                sb_num(&svg->body, lp->dash.pattern[i] * k, 3);
+                    sb_putc(svg->out, ' ');
+                sb_num(svg->out, lp->dash.pattern[i] * k, 3);
             }
-            sb_putc(&svg->body, '"');
+            sb_putc(svg->out, '"');
             if (lp->dash.offset != 0) {
-                sb_puts(&svg->body, " stroke-dashoffset=\"");
-                sb_num(&svg->body, lp->dash.offset * k, 3);
-                sb_putc(&svg->body, '"');
+                sb_puts(svg->out, " stroke-dashoffset=\"");
+                sb_num(svg->out, lp->dash.offset * k, 3);
+                sb_putc(svg->out, '"');
             }
         }
     }
-    sb_puts(&svg->body, "/>\n");
-    return svg->body.error;
+    svg_put_transparency(svg, pgs, SVG_PAINT_STROKE);
+    sb_puts(svg->out, "/>\n");
+    return svg->out->error;
 }
 
 static int
@@ -2341,6 +2393,8 @@ typedef struct svg_image_enum_s {
     bool stencil;               /* ImageMask: alpha from pass 0 */
     gx_color_index mask_color;
     bool pixelated;
+    float opacity;              /* fill alpha when the image began */
+    gs_blend_mode_t blend_mode;
 } svg_image_enum_t;
 
 gs_private_st_suffix_add4(st_svg_image_enum, svg_image_enum_t, "svg_image_enum_t",
@@ -2439,7 +2493,7 @@ svg_image_end_image(gx_image_enum_common_t *info, bool draw_last)
     }
     {
         svg_buf png;
-        svg_buf *body = &svg->body;
+        svg_buf *body = svg->out;
 
         sb_init(&png, svg_mem(svg));
         code = svg_encode_png(&png, pix, pie->gw, pie->gh, pie->gw * (alpha ? 4 : 3),
@@ -2478,6 +2532,17 @@ svg_image_end_image(gx_image_enum_common_t *info, bool draw_last)
                    (styled in svg_write_page) by browsers. */
                 sb_puts(body, " class=\"px\" image-rendering=\"optimizeSpeed\"");
                 svg->pixelated = true;
+            }
+            if (svg->Transparency) {
+                const char *blend = svg_blend_name(pie->blend_mode);
+
+                if (pie->opacity < 1) {
+                    sb_puts(body, " opacity=\"");
+                    sb_num(body, pie->opacity < 0 ? 0 : pie->opacity, 4);
+                    sb_putc(body, '"');
+                }
+                if (blend)
+                    sb_printf(body, " style=\"mix-blend-mode:%s\"", blend);
             }
             sb_puts(body, " xlink:href=\"data:image/png;base64,");
             sb_base64(body, (const byte *)png.data, png.len);
@@ -2639,6 +2704,8 @@ svg_begin_typed_image(gx_device *dev, const gs_gstate *pgs, const gs_matrix *pma
     gs_matrix_multiply(&g, &page, &pie->gm);
     /* Unsmoothed, visibly large samples (as the graphics library would
        draw them): keep them crisp. */
+    pie->opacity = pgs->fillconstantalpha;
+    pie->blend_mode = pgs->blend_mode;
     pie->pixelated = !pim->Interpolate && hypot(pie->gm.xx, pie->gm.xy) >= 2 &&
         hypot(pie->gm.yx, pie->gm.yy) >= 2;
 
@@ -2703,11 +2770,292 @@ use_default:
     return gx_default_begin_typed_image(dev, pgs, pmat, pic, prect, pdcolor, pcpath, mem, pinfo);
 }
 
+/* ---------------- Transparency ---------------- */
+
+/*
+ * The device handles PDF transparency itself, as pdfwrite does, instead of
+ * letting the graphics library push the pdf14 compositor (which would
+ * flatten everything to a raster image):
+ *
+ * - constant alpha and blend modes of individual objects become
+ *   fill-opacity / stroke-opacity / opacity and mix-blend-mode;
+ * - transparency groups become <g> elements with opacity, blend mode and
+ *   isolation (groups that need none of these aren't written);
+ * - soft masks become <mask> definitions, luminosity or alpha.  As in the
+ *   pdf14 compositor, a mask applies to the next group begun at the same
+ *   level, and stays active for later groups there until it is replaced.
+ *
+ * Soft mask transfer functions become a filter on the mask's content.
+ * Knockout groups are drawn as ordinary groups.
+ */
+
+static const char *
+svg_blend_name(gs_blend_mode_t bm)
+{
+    switch (bm) {
+    case BLEND_MODE_Multiply: return "multiply";
+    case BLEND_MODE_Screen: return "screen";
+    case BLEND_MODE_Overlay: return "overlay";
+    case BLEND_MODE_Darken: return "darken";
+    case BLEND_MODE_Lighten: return "lighten";
+    case BLEND_MODE_ColorDodge: return "color-dodge";
+    case BLEND_MODE_ColorBurn: return "color-burn";
+    case BLEND_MODE_HardLight: return "hard-light";
+    case BLEND_MODE_SoftLight: return "soft-light";
+    case BLEND_MODE_Difference: return "difference";
+    case BLEND_MODE_Exclusion: return "exclusion";
+    case BLEND_MODE_Hue: return "hue";
+    case BLEND_MODE_Saturation: return "saturation";
+    case BLEND_MODE_Color: return "color";
+    case BLEND_MODE_Luminosity: return "luminosity";
+    default: return NULL;       /* Normal, Compatible, CompatibleOverprint */
+    }
+}
+
+/* Write opacity and blend mode attributes for an element painted with
+   pgs's transparency state.  what: SVG_PAINT_FILL, _STROKE or _ELEMENT
+   (the opacity of the element as a whole, e.g. an image). */
+
+static void
+svg_put_transparency(gx_device_svg *svg, const gs_gstate *pgs, int what)
+{
+    const char *blend;
+    double a;
+
+    if (pgs == NULL || !svg->Transparency)
+        return;
+    a = what == SVG_PAINT_STROKE ? pgs->strokeconstantalpha : pgs->fillconstantalpha;
+    if (a < 1) {
+        sb_puts(svg->out, what == SVG_PAINT_FILL ? " fill-opacity=\"" :
+                what == SVG_PAINT_STROKE ? " stroke-opacity=\"" : " opacity=\"");
+        sb_num(svg->out, a < 0 ? 0 : a, 4);
+        sb_putc(svg->out, '"');
+    }
+    blend = svg_blend_name(pgs->blend_mode);
+    if (blend)
+        sb_printf(svg->out, " style=\"mix-blend-mode:%s\"", blend);
+}
+
+static svg_level *
+svg_push_level(gx_device_svg *svg)
+{
+    svg_level *lv;
+
+    if (svg->depth + 1 >= SVG_MAX_LEVELS)
+        return NULL;
+    lv = &svg->levels[++svg->depth];
+    memset(lv, 0, sizeof(*lv));
+    lv->parent_out = svg->out;
+    return lv;
+}
+
+static int
+svg_begin_group(gx_device_svg *svg, const gs_pdf14trans_params_t *params, bool page)
+{
+    int mask = svg->levels[svg->depth].active_mask;
+    double opacity = params->opacity * params->shape;
+    const char *blend = page ? NULL : svg_blend_name(params->blend_mode);
+    bool isolate = params->Isolated && !page;
+    svg_level *lv;
+    int code = svg_flush_canvas(svg);
+
+    if (code < 0)
+        return code;
+    svg_close_clip(svg);
+    lv = svg_push_level(svg);
+    if (lv == NULL)
+        return_error(gs_error_limitcheck);
+    if (opacity < 1 || mask || blend || isolate) {
+        sb_puts(svg->out, "<g");
+        if (opacity < 1) {
+            sb_puts(svg->out, " opacity=\"");
+            sb_num(svg->out, opacity < 0 ? 0 : opacity, 4);
+            sb_putc(svg->out, '"');
+        }
+        if (mask)
+            sb_printf(svg->out, " mask=\"url(#m%d)\"", mask);
+        if (blend || isolate) {
+            sb_puts(svg->out, " style=\"");
+            if (blend)
+                sb_printf(svg->out, "mix-blend-mode:%s%s", blend, isolate ? ";" : "");
+            if (isolate)
+                sb_puts(svg->out, "isolation:isolate");
+            sb_putc(svg->out, '"');
+        }
+        sb_puts(svg->out, ">\n");
+        lv->wrote_g = true;
+    }
+    return svg->out->error;
+}
+
+static int
+svg_end_group(gx_device_svg *svg)
+{
+    svg_level *lv = &svg->levels[svg->depth];
+    int code;
+
+    if (svg->depth == 0 || lv->is_mask)
+        return 0;               /* unbalanced: ignore */
+    code = svg_flush_canvas(svg);
+    if (code < 0)
+        return code;
+    svg_close_clip(svg);
+    if (lv->wrote_g)
+        sb_puts(svg->out, "</g>\n");
+    svg->depth--;
+    return svg->out->error;
+}
+
+static int
+svg_begin_mask(gx_device_svg *svg, const gs_pdf14trans_params_t *params)
+{
+    svg_level *lv;
+    int code;
+
+    if (params->subtype == TRANSPARENCY_MASK_None) {
+        svg->levels[svg->depth].active_mask = 0;
+        return 0;
+    }
+    code = svg_flush_canvas(svg);
+    if (code < 0)
+        return code;
+    svg_close_clip(svg);
+    lv = svg_push_level(svg);
+    if (lv == NULL)
+        return_error(gs_error_limitcheck);
+    lv->is_mask = true;
+    lv->alpha_mask = params->subtype == TRANSPARENCY_MASK_Alpha;
+    lv->backdrop = params->GrayBackground;
+    if (!params->function_is_identity) {
+        lv->has_tr = true;
+        memcpy(lv->tr, params->transfer_fn, sizeof(lv->tr));
+    }
+    sb_init(&lv->content, svg_mem(svg));
+    svg->out = &lv->content;
+    svg->mask_depth++;
+    return 0;
+}
+
+static int
+svg_end_mask(gx_device_svg *svg)
+{
+    svg_level *lv = &svg->levels[svg->depth];
+    svg_buf d;
+    int code, id, filter = 0, i;
+
+    if (svg->depth == 0 || !lv->is_mask)
+        return 0;               /* unbalanced: ignore */
+    code = svg_flush_canvas(svg);
+    if (code < 0)
+        return code;
+    svg_close_clip(svg);
+    sb_init(&d, svg_mem(svg));
+    if (lv->has_tr) {
+        /* The transfer function maps the mask's luminosity (or alpha) to
+           its value: make the luminosity the alpha, look it up in a table,
+           and use the result as an alpha mask. */
+        sb_puts(&d, " filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"");
+        sb_num(&d, svg->width * svg_sx(svg), 3);
+        sb_puts(&d, "\" height=\"");
+        sb_num(&d, svg->height * svg_sy(svg), 3);
+        sb_puts(&d, "\" color-interpolation-filters=\"sRGB\">");
+        if (!lv->alpha_mask)
+            sb_puts(&d, "<feColorMatrix type=\"luminanceToAlpha\"/>");
+        sb_puts(&d, "<feComponentTransfer><feFuncA type=\"table\" tableValues=\"");
+        for (i = 0; i <= 32; ++i) {
+            if (i)
+                sb_putc(&d, ' ');
+            sb_num(&d, lv->tr[min(i * 8, 255)] / 255.0, 3);
+        }
+        sb_puts(&d, "\"/></feComponentTransfer></filter>");
+        filter = svg_put_def(svg, "filter", 'f', &d);
+        d.len = 0;
+        if (filter < 0) {
+            sb_free(&d);
+            return filter;
+        }
+    }
+    sb_puts(&d, " maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"");
+    sb_num(&d, svg->width * svg_sx(svg), 3);
+    sb_puts(&d, "\" height=\"");
+    sb_num(&d, svg->height * svg_sy(svg), 3);
+    sb_putc(&d, '"');
+    if (lv->alpha_mask || filter)
+        sb_puts(&d, " mask-type=\"alpha\"");
+    sb_putc(&d, '>');
+    if (filter)
+        sb_printf(&d, "<g filter=\"url(#f%d)\">", filter);
+    if (!lv->alpha_mask && (lv->backdrop > 0 || filter)) {
+        /* Where the mask's group paints nothing, its luminosity is the
+           backdrop's. */
+        int g = (int)(lv->backdrop * 255 + 0.5);
+
+        g = g < 0 ? 0 : g > 255 ? 255 : g;
+        sb_puts(&d, "<rect width=\"100%\" height=\"100%\" fill=\"");
+        sb_color(&d, ((gx_color_index)g << 16) | (g << 8) | g);
+        sb_puts(&d, "\"/>");
+    }
+    if (lv->content.data)
+        sb_write(&d, lv->content.data, lv->content.len);
+    if (filter)
+        sb_puts(&d, "</g>");
+    sb_puts(&d, "</mask>");
+    id = svg_put_def(svg, "mask", 'm', &d);
+    sb_free(&d);
+    sb_free(&lv->content);
+    svg->out = lv->parent_out;
+    svg->depth--;
+    svg->mask_depth--;
+    if (id < 0)
+        return id;
+    svg->levels[svg->depth].active_mask = id;
+    return 0;
+}
+
+static int
+svg_composite(gx_device *dev, gx_device **pcdev, const gs_composite_t *pct,
+              gs_gstate *pgs, gs_memory_t *memory, gx_device *cdev)
+{
+    gx_device_svg *svg = (gx_device_svg *)dev;
+
+    if (svg->Transparency && pct->type->comp_id == GX_COMPOSITOR_PDF14_TRANS) {
+        const gs_pdf14trans_params_t *params = &((const gs_pdf14trans_t *)pct)->params;
+
+        /* Handle transparency ourselves: the compositor device is us. */
+        *pcdev = dev;
+        switch (params->pdf14_op) {
+        case PDF14_BEGIN_TRANS_PAGE_GROUP:
+            return svg_begin_group(svg, params, true);
+        case PDF14_BEGIN_TRANS_GROUP:
+            return svg_begin_group(svg, params, false);
+        case PDF14_END_TRANS_GROUP:
+            return svg_end_group(svg);
+        case PDF14_BEGIN_TRANS_MASK:
+            return svg_begin_mask(svg, params);
+        case PDF14_END_TRANS_MASK:
+            return svg_end_mask(svg);
+        default:
+            /* Device push/pop, text groups, blend parameters (read from the
+               graphics state when painting), state push/pop. */
+            return 0;
+        }
+    }
+    return gx_default_composite(dev, pcdev, pct, pgs, memory, cdev);
+}
+
 /* ---------------- Pages ---------------- */
 
 static void
 svg_page_reset(gx_device_svg *svg)
 {
+    while (svg->depth > 0) {
+        if (svg->levels[svg->depth].is_mask)
+            sb_free(&svg->levels[svg->depth].content);
+        svg->depth--;
+    }
+    memset(&svg->levels[0], 0, sizeof(svg->levels[0]));
+    svg->out = &svg->body;
+    svg->mask_depth = 0;
     svg->defs.len = svg->body.len = svg->text.len = 0;
     svg->defs.error = svg->body.error = svg->text.error = 0;
     svg->clip_open = false;
@@ -2734,9 +3082,9 @@ svg_fillpage(gx_device *dev, gs_gstate *pgs, gx_device_color *pdevc)
     /* Erasing the page discards everything drawn on it so far. */
     svg_page_reset(svg);
     if (gx_dc_is_pure(pdevc) && gx_dc_pure_color(pdevc) != 0xffffff) {
-        sb_puts(&svg->body, "<rect width=\"100%\" height=\"100%\" fill=\"");
-        sb_color(&svg->body, gx_dc_pure_color(pdevc));
-        sb_puts(&svg->body, "\"/>\n");
+        sb_puts(svg->out, "<rect width=\"100%\" height=\"100%\" fill=\"");
+        sb_color(svg->out, gx_dc_pure_color(pdevc));
+        sb_puts(svg->out, "\"/>\n");
     }
     return 0;
 }
@@ -2755,6 +3103,18 @@ svg_write_page(gx_device_svg *svg)
         return code;
     svg_close_clip(svg);
     svg_flush_run(svg);
+    /* Close any groups the job left open. */
+    while (svg->depth > 0) {
+        svg_level *lv = &svg->levels[svg->depth];
+
+        if (lv->is_mask) {
+            sb_free(&lv->content);
+            svg->mask_depth--;
+        } else if (lv->wrote_g)
+            sb_puts(lv->parent_out, "</g>\n");
+        svg->out = lv->parent_out;
+        svg->depth--;
+    }
     if (svg->defs.error || svg->body.error || svg->text.error)
         return_error(gs_error_VMerror);
 
@@ -2837,6 +3197,7 @@ svg_open_device(gx_device *dev)
     gdev_vector_init(vdev);
     sb_init(&svg->defs, mem);
     sb_init(&svg->body, mem);
+    svg->out = &svg->body;
     sb_init(&svg->text, mem);
     sb_init(&svg->run.xs, mem);
     sb_init(&svg->run.chars, mem);
@@ -2847,6 +3208,7 @@ svg_open_device(gx_device *dev)
     svg->text_invisible = false;
     svg->pages_written = 0;
     svg->warned_multipage = false;
+    svg->depth = 0;
     svg_page_reset(svg);
     return 0;
 }
@@ -2856,6 +3218,7 @@ svg_close_device(gx_device *dev)
 {
     gx_device_svg *svg = (gx_device_svg *)dev;
 
+    svg_page_reset(svg);
     sb_free(&svg->defs);
     sb_free(&svg->body);
     sb_free(&svg->text);
@@ -2881,6 +3244,8 @@ svg_get_params(gx_device *dev, gs_param_list *plist)
         return code;
     if ((code = param_write_bool(plist, "SVGTextLayer", &svg->TextLayer)) < 0)
         return code;
+    if ((code = param_write_bool(plist, "SVGTransparency", &svg->Transparency)) < 0)
+        return code;
     return param_write_bool(plist, "SVGReuseGlyphs", &svg->ReuseGlyphs);
 }
 
@@ -2889,13 +3254,15 @@ svg_put_params(gx_device *dev, gs_param_list *plist)
 {
     gx_device_svg *svg = (gx_device_svg *)dev;
     gx_device_vector *vdev = (gx_device_vector *)dev;
-    bool text_layer = svg->TextLayer, reuse = svg->ReuseGlyphs;
+    bool text_layer = svg->TextLayer, reuse = svg->ReuseGlyphs, transparency = svg->Transparency;
     int code, ecode = 0;
 
     if ((code = param_read_bool(plist, "SVGTextLayer", &text_layer)) < 0)
         param_signal_error(plist, "SVGTextLayer", ecode = code);
     if ((code = param_read_bool(plist, "SVGReuseGlyphs", &reuse)) < 0)
         param_signal_error(plist, "SVGReuseGlyphs", ecode = code);
+    if ((code = param_read_bool(plist, "SVGTransparency", &transparency)) < 0)
+        param_signal_error(plist, "SVGTransparency", ecode = code);
     if (ecode < 0)
         return ecode;
     code = gdev_vector_put_params(dev, plist);
@@ -2907,6 +3274,7 @@ svg_put_params(gx_device *dev, gs_param_list *plist)
         gdev_vector_close_file(vdev);
     svg->TextLayer = text_layer;
     svg->ReuseGlyphs = reuse;
+    svg->Transparency = transparency;
     return 0;
 }
 
@@ -2936,6 +3304,8 @@ svg_dev_spec_op(gx_device *dev, int op, void *data, int size)
                 return param_write_bool(request->list, "SVGTextLayer", &svg->TextLayer);
             if (strcmp(request->Param, "SVGReuseGlyphs") == 0)
                 return param_write_bool(request->list, "SVGReuseGlyphs", &svg->ReuseGlyphs);
+            if (strcmp(request->Param, "SVGTransparency") == 0)
+                return param_write_bool(request->list, "SVGTransparency", &svg->Transparency);
         }
         break;
     }
