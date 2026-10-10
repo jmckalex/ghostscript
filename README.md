@@ -10,10 +10,14 @@ device** that turns PostScript, EPS and PDF into high-quality SVG (see
 The upstream source is vendored in `src/ghostscript-10.08.0` (downloaded
 from the [Artifex release][rel] and SHA-512 verified against its
 `SHA512SUMS`). It was committed unmodified, so `git diff` against the import
-commit shows exactly what changed: one new file,
-`devices/vector/gdevsvg.c`, plus its rule in `devices/devs.mak`. The rest of
-the port is `build.sh` (configure flags and Emscripten link settings) and
-the JS wrappers in `js/`.
+commit shows exactly what changed: one new file, `devices/vector/gdevsvg.c`;
+its build rules (`devices/devs.mak`, and the device lists in `configure`,
+`configure.ac` and `psi/msvc.mak`); its documentation
+(`doc/src/VectorDevices.rst` and `Devices.rst`); and a two-line fix in
+`pdf/pdf.mak`. That diff is also a patch that adds the device to a
+[native Ghostscript](#native-ghostscript). The rest of the port is
+`build.sh` (configure flags and Emscripten link settings) and the JS wrappers
+in `js/`.
 
 [rel]: https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/tag/gs10080
 
@@ -29,7 +33,9 @@ the JS wrappers in `js/`.
 | `test/` | tests (`npm test`) |
 | `tools/svg-compare.mjs` | pixel comparison of SVG output against Ghostscript's raster output |
 | `tools/make-transparency-pdf.mjs` | writes the transparency test PDF (`demo/samples/transparency.pdf`) |
-| `tools/native-build.sh` | native builds: debug (ASan) `gs`, or `lib` for `libgs.dylib` |
+| `tools/native-build.sh` | native builds: `release` `gs`, debug (ASan) `gs`, or `lib` for `libgs.dylib` |
+| `tools/make-patch.sh` | the svg device as a patch against the Ghostscript release |
+| `tools/check-patch.sh` | builds the release + patch natively, as a user would, and tries the device |
 | `tools/mirror-source.sh` | symlink mirror of the source tree, for out-of-tree builds |
 | `dist/` | build output: `gs.js`, `gs.wasm` + the wrappers |
 
@@ -63,7 +69,8 @@ builds in `build/wasm-lean/`, a mirror of the source tree, and writes to
 Most of what remains is the built-in resources (fonts, CMaps, init files) and
 the two interpreters.
 
-**Native library.** `tools/native-build.sh lib` builds an optimized
+**Native builds.** See [Native Ghostscript](#native-ghostscript) for a native
+`gs` with the device. `tools/native-build.sh lib` builds an optimized
 `build/native-lib/sobin/libgs.dylib` from the same source, e.g. as a native
 reference for software that embeds Ghostscript.
 
@@ -227,17 +234,20 @@ high-level device interface:
   (`/TR`) becomes a filter on the mask. Images with an SMask are drawn
   through a mask too. Knockout groups are drawn as ordinary groups.
 - **Anything SVG can't express is still drawn exactly.** That covers mesh and
-  function-based shadings, tiling patterns, ImageType 3 masks, and raster
-  operations.
+  function-based shadings, radial shadings whose circles aren't nested
+  (cones), tiling patterns, ImageType 3 masks, and raster operations.
   The graphics library rasterizes it into an RGBA canvas at the device
   resolution, and that canvas is embedded as a PNG at the right point in the
   painting order. The default resolution is 192 dpi, and `-r` changes it. Vector
   content doesn't depend on the resolution.
 
 Output is one standalone SVG 1.1 file per page, sized in points; use `%d` in
-the output file name for multi-page input. Two SVG 2 features are used:
-`fr` for radial gradients whose start circle is off-center, and
-`vector-effect` for zero-width (hairline) strokes.
+the output file name for multi-page input. A few SVG 2 and CSS features that
+browsers support are used: `mix-blend-mode`, `isolation` and `mask-type` for
+transparency, `fr` for radial gradients whose start circle has a radius and
+is off-center, `vector-effect` for zero-width (hairline) strokes, and
+`image-rendering` for crisp pixels. The user documentation is the "SVG
+output" section of `src/ghostscript-10.08.0/doc/src/VectorDevices.rst`.
 
 | Parameter | Default | |
 |---|---|---|
@@ -253,6 +263,38 @@ pixel. `npm test` runs it on the samples. On the Ghostscript example files,
 typically under 1% of pixels differ noticeably, mostly antialiased edges. The
 largest differences are PostScript hairlines, which raster devices widen to
 a whole pixel and SVG draws at their true width.
+
+## Native Ghostscript
+
+The `svg` device is ordinary Ghostscript C, with nothing in it specific to
+WebAssembly, so it works in a native Ghostscript too. `tools/make-patch.sh`
+writes what this repository changes in the Ghostscript tree as a patch
+against the 10.08.0 release (`build/ghostscript-10.08.0-svg.patch`):
+
+```sh
+tar xf ghostscript-10.08.0.tar.xz && cd ghostscript-10.08.0
+patch -p1 < ghostscript-10.08.0-svg.patch
+./configure && make
+bin/gs -sDEVICE=svg -o page-%d.svg input.pdf
+```
+
+The patch adds the device to configure's file-format devices (`FILES`, part
+of the default `ALL`) whenever libpng is available, which it always is with
+the bundled copy; `--with-drivers=SVG` selects it on its own. It is in the
+Windows device list (`psi/msvc.mak`) too, untested.
+
+On a Mac with Homebrew's fontconfig installed, a stock 10.08.0 build stops
+while compiling its build tools (`base/gp_unix.c`: `fontconfig/fontconfig.h`
+not found). Configure with `--disable-fontconfig`: Ghostscript's own fonts
+are built in.
+
+`tools/check-patch.sh` checks the patch as a user would use it: it extracts
+the release from the import commit, applies the patch, configures and builds
+it, and converts `tiger.eps` (about a minute and a half on an Apple-silicon
+Mac). Its SVG is byte-identical to the WebAssembly build's.
+`tools/native-build.sh release` builds the working tree the same way, every
+device included but fontconfig, dbus and libidn left out so that it needs
+only system libraries, into `build/native-release/bin/gs`.
 
 ## Demo
 
