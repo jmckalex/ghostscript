@@ -13,6 +13,7 @@ const SAMPLES = [
   ['Shadings → gradients', 'samples/shadings.ps'],
   ['Strokes: caps, joins, dashes', 'samples/strokes.ps'],
   ['Images', 'samples/images.ps'],
+  ['Transparency (PDF)', 'samples/transparency.pdf'],
   ['Text, graphics & image (PDF)', EX + 'text_graphic_image.pdf'],
   ['Annotations (PDF, 6 pages)', EX + 'annots.pdf'],
 ];
@@ -66,7 +67,8 @@ function requestRender() {
   const name = source.name;
   const bytes = edited ? withShowpage(textToBytes(editor.value)) : source.bytes;
   const args = ['-sDEVICE=svg', '-o', 'page-%d.svg',
-    `-dSVGTextLayer=${$('text-layer').checked}`, `-dSVGReuseGlyphs=${$('reuse').checked}`];
+    `-dSVGTextLayer=${$('text-layer').checked}`, `-dSVGReuseGlyphs=${$('reuse').checked}`,
+    `-dSVGTransparency=${$('transparency').checked}`];
   if (/\.(eps|epsf|ai)$/i.test(name)) args.push('-dEPSCrop');
   queued = { id: ++seq, name, bytes, args };
   next();
@@ -251,6 +253,7 @@ $('zoom').addEventListener('change', applyZoom);
 $('show-text').addEventListener('change', (e) => $('viewer').classList.toggle('show-text', e.target.checked));
 $('text-layer').addEventListener('change', requestRender);
 $('reuse').addEventListener('change', requestRender);
+$('transparency').addEventListener('change', requestRender);
 
 let timer;
 editor.addEventListener('input', () => {

@@ -28,7 +28,9 @@ the JS wrappers in `js/`.
 | `demo/` | browser demo: PostScript/PDF → SVG (`npm run demo`) |
 | `test/` | tests (`npm test`) |
 | `tools/svg-compare.mjs` | pixel comparison of SVG output against Ghostscript's raster output |
-| `tools/native-build.sh` | native debug (ASan) build, for working on the device |
+| `tools/make-transparency-pdf.mjs` | writes the transparency test PDF (`demo/samples/transparency.pdf`) |
+| `tools/native-build.sh` | native builds: debug (ASan) `gs`, or `lib` for `libgs.dylib` |
+| `tools/mirror-source.sh` | symlink mirror of the source tree, for out-of-tree builds |
 | `dist/` | build output: `gs.js`, `gs.wasm` + the wrappers |
 
 ## Building
@@ -45,6 +47,25 @@ npm test
 ```
 
 Knobs: `OPT` (default `-O2`), `JOBS` (default: all CPUs), `EMSDK_ENV`, `CCAUX`.
+
+**Variants.** `VARIANT=lean ./build.sh` builds just the PostScript and PDF
+interpreters, for embedding through the [library API](#library-api-gsapi).
+It has no output devices beyond `bbox` and the null device, no libtiff, and
+no DroidSansFallback (the built-in substitute for missing CJK fonts). It
+builds in `build/wasm-lean/`, a mirror of the source tree, and writes to
+`dist/lean/`.
+
+| | `gs.wasm` | gzip | brotli |
+|---|---|---|---|
+| full | 16.5 MB | 11.3 MB | 10.7 MB |
+| lean | 12.5 MB | 8.6 MB | 8.1 MB |
+
+Most of what remains is the built-in resources (fonts, CMaps, init files) and
+the two interpreters.
+
+**Native library.** `tools/native-build.sh lib` builds an optimized
+`build/native-lib/sobin/libgs.dylib` from the same source, e.g. as a native
+reference for software that embeds Ghostscript.
 
 ### How the cross-build works
 
@@ -115,6 +136,37 @@ cat in.ps | node dist/gs-cli.mjs -q -sDEVICE=pdfwrite -o - - > out.pdf
 The host filesystem is mounted, so paths work as they do with native `gs`.
 Stdin and stdout pass raw bytes, so binary output to `-` is safe.
 
+### Library API (gsapi)
+
+Both variants export Ghostscript's C API (`gsapi_revision`,
+`gsapi_new_instance`, `gsapi_set_stdio`, `gsapi_init_with_args`,
+`gsapi_run_string_begin` / `_continue` / `_end`, `gsapi_run_file`,
+`gsapi_exit`, `gsapi_delete_instance`, and the rest of `psi/iapi.h`), with
+`_malloc`/`_free`. The runtime methods `HEAPU8`, `UTF8ToString`,
+`stringToUTF8`, `lengthBytesUTF8` and `addFunction`/`removeFunction` are
+exported too, so callbacks such as stdio can be passed as function pointers.
+This is how dvisvgm uses Ghostscript, and `test/gsapi.test.mjs` drives it the
+same way:
+
+```js
+import createGhostscript from './dist/gs.js';
+const gs = await createGhostscript();
+const stdout = gs.addFunction((handle, str, len) => {
+  process.stdout.write(gs.HEAPU8.subarray(str, str + len));
+  return len;
+}, 'iiii');
+// gsapi_new_instance(&inst, NULL); gsapi_set_stdio(inst, stdin, stdout, stderr);
+// gsapi_init_with_args(inst, argc, argv); gsapi_run_string_*(...); gsapi_exit(inst);
+// gsapi_delete_instance(inst)
+```
+
+One instance exists at a time, but a module can go through any number of
+`new_instance` … `delete_instance` cycles, one per document. The test runs
+30 in one module, and the heap stops growing after the first few. `PROXYFS`
+is linked, so another Emscripten module's files can be mounted into
+Ghostscript's file system:
+`gs.FS.mount(gs.PROXYFS, { root: '/work', fs: other.FS }, '/work')`.
+
 ### Raw Emscripten module
 
 `dist/gs.js` is the plain Emscripten factory if you want to work with
@@ -166,9 +218,17 @@ high-level device interface:
   needed to stay within one color level are kept. `Extend` and `BBox` are
   respected (by clipping where SVG can't express them directly). Gradient
   fills of text and strokes work too, and identical definitions are shared.
+- **PDF transparency is native SVG.** The device takes the place of
+  Ghostscript's transparency compositor (as pdfwrite does), so constant
+  alpha becomes `fill-opacity` / `stroke-opacity`, blend modes become
+  `mix-blend-mode`, and transparency groups become `<g>` elements with
+  opacity and isolation. Soft masks become `<mask>` elements, luminosity or
+  alpha, including a backdrop color (`/BC`), and a transfer function
+  (`/TR`) becomes a filter on the mask. Images with an SMask are drawn
+  through a mask too. Knockout groups are drawn as ordinary groups.
 - **Anything SVG can't express is still drawn exactly.** That covers mesh and
-  function-based shadings, tiling patterns, ImageType 3 masks, raster
-  operations, and transparency (which goes through Ghostscript's compositor).
+  function-based shadings, tiling patterns, ImageType 3 masks, and raster
+  operations.
   The graphics library rasterizes it into an RGBA canvas at the device
   resolution, and that canvas is embedded as a PNG at the right point in the
   painting order. The default resolution is 192 dpi, and `-r` changes it. Vector
@@ -183,6 +243,7 @@ the output file name for multi-page input. Two SVG 2 features are used:
 |---|---|---|
 | `-dSVGTextLayer=false` | true | omit the invisible text layer |
 | `-dSVGReuseGlyphs=false` | true | write each glyph as a plain path instead of `<use>` |
+| `-dSVGTransparency=false` | true | let Ghostscript's compositor flatten transparency to images |
 | `-r<dpi>` | 192 | resolution of rasterized fallback content |
 
 **Fidelity** is checked by `tools/svg-compare.mjs`. It renders each file
@@ -206,7 +267,7 @@ text layer" makes the invisible text visible.
 
 ## Developing the device
 
-`tools/native-build.sh` makes a native debug build with AddressSanitizer in
+`tools/native-build.sh` (or `tools/native-build.sh debug`) makes a native debug build with AddressSanitizer in
 `build/native/` (about a minute). It builds from a mirror of the source tree
 made of symlinks, so edits to `gdevsvg.c` need only an incremental `make`,
 and it doesn't touch the WASM build. Then:

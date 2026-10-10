@@ -66,6 +66,27 @@ test('images are embedded at their own resolution, unsmoothed ones kept crisp', 
   assert.equal(png.readUInt32BE(20), 4);
 });
 
+test('PDF transparency is native SVG: opacity, blend modes, groups and soft masks', async () => {
+  const [svg] = await toSvg(SAMPLES + 'transparency.pdf');
+  assert.match(svg, / fill-opacity=".5"/);
+  assert.match(svg, / stroke-opacity=".5"/);
+  for (const mode of ['multiply', 'screen', 'difference']) assert.match(svg, new RegExp(`mix-blend-mode:${mode}`));
+  assert.match(svg, /<g opacity=".5" style="isolation:isolate">/);            // group at 50%
+  assert.match(svg, /<mask id="m\d+" maskUnits="userSpaceOnUse"[^>]*>/);      // luminosity masks
+  assert.match(svg, /<mask [^>]*mask-type="alpha">/);                          // alpha mask
+  assert.match(svg, /<rect width="100%" height="100%" fill="#fff"\/>/);       // /BC [1]
+  assert.match(svg, /<filter [^>]*><feColorMatrix type="luminanceToAlpha"\/>/); // /TR
+  assert.match(svg, /<g mask="url\(#m\d+\)"/);
+  // Only the image and its soft mask are raster.
+  assert.equal(count(svg, /<image /g), 2);
+});
+
+test('-dSVGTransparency=false flattens transparency through the compositor', async () => {
+  const [svg] = await toSvg(SAMPLES + 'transparency.pdf', ['-dSVGTransparency=false']);
+  assert.equal(count(svg, /<mask /g), 0);
+  assert.ok(count(svg, /<image /g) >= 1);
+});
+
 test('one file per page', async () => {
   const pages = await toSvg(EXAMPLES + 'annots.pdf');
   assert.equal(pages.length, 6);
@@ -80,7 +101,8 @@ test('device parameters turn off the text layer and glyph reuse', async () => {
 test('renders like the raster devices', () => {
   // Pixel comparison against Ghostscript's own png16m rendering.
   for (const file of [SAMPLES + 'hello.ps', SAMPLES + 'shadings.ps', SAMPLES + 'images.ps',
-    SAMPLES + 'strokes.ps', EXAMPLES + 'tiger.eps', EXAMPLES + 'text_graphic_image.pdf']) {
+    SAMPLES + 'strokes.ps', SAMPLES + 'transparency.pdf', EXAMPLES + 'tiger.eps',
+    EXAMPLES + 'text_graphic_image.pdf']) {
     for (const row of compareFile(file, { res: 96, ss: 4 })) {
       assert.ok(!row.error, `${row.file}: ${row.error}`);
       assert.ok(row.mean < 3, `${row.file} page ${row.page}: mean difference ${row.mean.toFixed(2)}`);
